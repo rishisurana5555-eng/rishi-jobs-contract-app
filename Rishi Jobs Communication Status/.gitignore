@@ -1,0 +1,13 @@
+node_modules
+dist
+.env
+.env.local
+.firebase
+*-debug.log
+service-account*.json
+scripts/team.json
+serviceAccountKey.json
+*.json.key
+login-credentials.txt
+*.tsbuildinfo
+.firebase/
