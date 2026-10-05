@@ -107,7 +107,7 @@ export function DeleteCandidateDialog({ candidateId, name, onClose, onDeleted }:
 
 /** "Delete client": its job openings and the submissions to it go; the candidates stay. */
 export function DeleteClientDialog({ client, onClose }: { client: Client; onClose: () => void }) {
-  const { backend, jobs } = useApp()
+  const { backend, jobs, me } = useApp()
   const { data: list, error: loadError } = useLoad(() => backend.findClientApps(client.id))
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -118,7 +118,7 @@ export function DeleteClientDialog({ client, onClose }: { client: Client; onClos
     setBusy(true)
     setError(null)
     try {
-      const r = await backend.deleteClient(client.id)
+      const r = await backend.deleteClient(client.id, me)
       setDone(`${client.name} was deleted, with ${clientJobs.length} job opening${clientJobs.length === 1 ? '' : 's'} and ${r.submissions} submission${r.submissions === 1 ? '' : 's'}. The candidates are kept.${trashNote(r)}`)
     } catch (e) {
       setError((e as Error).message)

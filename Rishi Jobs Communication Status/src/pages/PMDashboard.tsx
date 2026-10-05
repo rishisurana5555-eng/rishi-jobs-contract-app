@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { ApplicationTable } from '../components/ApplicationTable'
 import { ColorLegend } from '../components/StatusBadge'
-import { byRecent, DashboardTop, FilterBar, StatCard, StatusFilter, useSearch } from '../components/DashboardWidgets'
+import { FilterBar, StatusFilter, useCountBoxes, useSearch } from '../components/DashboardWidgets'
 import { CandidatesList } from '../components/CandidatesList'
 import { JobOpenings } from '../components/JobOpenings'
 import { Select, Tabs } from '../components/ui'
@@ -33,8 +33,18 @@ export function PMDashboard() {
     debrief: ['Debrief Pending', (a) => a.stage === 'debrief_pending'],
     completed: ['Completed', (a) => isClosed(a.stage)],
   }
-  const shown = apps.filter((a) => tests[filter][1](a) && match(a) && (!ctId || a.assignedClientTeam === ctId)).sort(byRecent)
-  const fromPe = apps.filter(tests.from_pe[1]).sort((a, b) => a.createdAt - b.createdAt)
+  const shown = apps.filter((a) => tests[filter][1](a) && match(a) && (!ctId || a.assignedClientTeam === ctId))
+  const fromPe = apps.filter(tests.from_pe[1])
+  const interviews = apps.filter(tests.interview[1])
+  const { boxes, page } = useCountBoxes(
+    [
+      { key: 'action', label: 'My action required', count: actionRequired.length, tone: 'red', apps: actionRequired, empty: '🎉 Nothing needs your action right now.' },
+      { key: 'from_pe', label: 'New from PEs – to send', count: fromPe.length, tone: 'red', apps: fromPe, empty: 'No new candidates from your PEs.' },
+      { key: 'unread', label: 'Unread updates', count: unread.length, tone: 'amber', apps: unread, empty: 'No unread updates.' },
+      { key: 'interview', label: 'Interviews scheduled', count: interviews.length, tone: 'blue', apps: interviews, empty: 'No interviews scheduled.' },
+    ],
+    'pm',
+  )
   const clientTeam = users.filter((u) => u.role === 'ClientTeam' && u.active !== false).sort((a, b) => a.name.localeCompare(b.name))
 
   return (
@@ -42,7 +52,6 @@ export function PMDashboard() {
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <h1 className="text-xl font-bold text-slate-900">Hello, {me.name}</h1>
-          <p className="text-sm text-slate-500">Assign your job openings to your PEs; check the candidates they add, revise the CV and send them to the Client Team.</p>
         </div>
         <Tabs
           value={tab}
@@ -59,20 +68,11 @@ export function PMDashboard() {
         <JobOpenings />
       ) : tab === 'candidates' ? (
         <CandidatesList />
+      ) : page ? (
+        page
       ) : (
       <>
-      <DashboardTop
-        actionApps={actionRequired}
-        stats={
-          <>
-            <StatCard label="Action required" value={actionRequired.length} tone="red" onClick={() => setFilter('action')} active={filter === 'action'} />
-            <StatCard label="New from PEs – to send" value={fromPe.length} tone="red" onClick={() => setFilter('from_pe')} active={filter === 'from_pe'} />
-            <StatCard label="Unread updates" value={unread.length} tone="amber" onClick={() => setFilter('unread')} active={filter === 'unread'} />
-            <StatCard label="Interviews scheduled" value={apps.filter(tests.interview[1]).length} tone="blue" onClick={() => setFilter('interview')} active={filter === 'interview'} />
-          </>
-        }
-      />
-
+      {boxes}
 
       <section className="space-y-3">
         <h2 className="text-sm font-semibold text-slate-700">All my candidates</h2>

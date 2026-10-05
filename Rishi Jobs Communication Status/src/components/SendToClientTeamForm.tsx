@@ -72,6 +72,8 @@ function SendToClientTeamForm({ app, onDone }: { app: Application; onDone: (appI
   // Starts with what the PE wrote (the candidate's available dates), for the PM to check and pass on.
   // (not the PE's last answer to a doubt).
   const [message, setMessage] = useState(app.availabilityNote ?? app.latestMessage ?? '')
+  /** why the PM selected this candidate: goes into the history */
+  const [reason, setReason] = useState('')
   /** the revised CV preview is open (it opens by itself as soon as a revised CV is ready) */
   const [reviewing, setReviewing] = useState(false)
   /** the PM confirmed they checked this revised CV (reset whenever the revised CV changes) */
@@ -82,10 +84,8 @@ function SendToClientTeamForm({ app, onDone }: { app: Application; onDone: (appI
   const [error, setError] = useState<string | null>(null)
 
   const client = clients.find((c) => c.id === place.clientId)
-  const openingTitle = jobs.find((j) => j.id === place.jobId)?.title ?? ''
-  // Job title for the revised CV's file name: the job opening's, unless the PM types their own.
-  const [cvJobTitle, setCvJobTitle] = useState<string | null>(null)
-  const jobTitleForCv = cvJobTitle ?? openingTitle
+  // Job title printed on the revised CV and used in its file name: always typed in by the PM (never filled in).
+  const [jobTitleForCv, setCvJobTitle] = useState('')
   const previewUrl = useMemo(() => (revised ? URL.createObjectURL(revised) : null), [revised])
   useEffect(() => () => void (previewUrl && URL.revokeObjectURL(previewUrl)), [previewUrl])
   // Every new revised CV must be checked: open it straight away and ask for a fresh confirmation.
@@ -95,23 +95,34 @@ function SendToClientTeamForm({ app, onDone }: { app: Application; onDone: (appI
   }, [revised])
   useEffect(() => setChecked(false), [cvLink])
 
+  /**
+   * What still stops the candidate being sent (null: ready). The Send button stays disabled until the
+   * revised CV is made, checked and confirmed, and every detail is right.
+   */
+  function sendProblem(): string | null {
+    if (!candidateName.trim()) return 'Enter the candidate’s name.'
+    const phone = phoneProblem(contact)
+    if (phone) return phone
+    const alt = altPhoneProblem(altContact, contact)
+    if (alt) return alt
+    if (taken) return duplicatePhoneMessage(taken, me.id)
+    if (!place.clientId || !place.jobId) return 'Choose the client and the job opening.'
+    const detailsProblem = cvDetailsProblem(details)
+    if (detailsProblem) return detailsProblem
+    if (cvMode === 'editor' && !jobTitleForCv.trim()) return 'Type the job title for the revised CV.'
+    if (cvMode !== 'link' && !revised) return cvMode === 'editor' ? 'Generate the revised CV first (or upload the revised CV).' : 'Upload the revised CV.'
+    if (cvMode === 'link' && !/^https?:\/\//i.test(cvLink.trim())) return 'Paste a valid link to the revised CV (starting with https://).'
+    if (!checked) return 'Open and check the revised CV, then confirm it.'
+    if (!message.trim()) return 'Write the candidate’s available interview dates in the message box.'
+    if (!reason.trim()) return 'Write the reason for selection.'
+    return null
+  }
+  const blocker = sendProblem()
+
   async function submit(e: FormEvent) {
     e.preventDefault()
     setError(null)
-    if (cvMode !== 'link' && !revised) return setError(cvMode === 'editor' ? 'Revise the CV in the CV editor first (or upload the revised CV).' : 'Upload the revised CV.')
-    if (cvMode === 'link' && !/^https?:\/\//i.test(cvLink.trim())) return setError('Paste a valid link to the revised CV (starting with https://).')
-    if (!checked) {
-      if (cvMode !== 'link') setReviewing(true)
-      return setError('Check the revised CV and confirm it before sending.')
-    }
-    const phone = phoneProblem(contact)
-    if (phone) return setError(phone)
-    const alt = altPhoneProblem(altContact, contact)
-    if (alt) return setError(alt)
-    if (taken) return setError(duplicatePhoneMessage(taken, me.id))
-    if (!message.trim()) return setError('Write the candidate’s available interview dates in the message box.')
-    const detailsProblem = cvDetailsProblem(details)
-    if (detailsProblem) return setError(detailsProblem)
+    if (blocker) return setError(blocker)
     setBusy(true)
     setStep(cvMode !== 'link' ? 'Saving the revised CV to Google Drive…' : 'Saving…')
     /** the revised CV uploaded by this send: trashed again if the candidate can't be sent */
@@ -129,6 +140,7 @@ function SendToClientTeamForm({ app, onDone }: { app: Application; onDone: (appI
       const id = await perform(app.id, {
         kind: 'send_to_ct',
         message,
+        reason,
         data: {
           candidateId: app.candidateId,
           candidateName,
@@ -231,7 +243,7 @@ function SendToClientTeamForm({ app, onDone }: { app: Application; onDone: (appI
             className="mb-2 sm:max-w-md"
             hint={`File name: ${[fileSafe(candidateName) || 'Candidate', fileSafe(jobTitleForCv), 'RishiJobs'].filter(Boolean).join('_')}.pdf`}
           >
-            <Input value={jobTitleForCv} onChange={(e) => setCvJobTitle(e.target.value)} placeholder="e.g. Senior Accountant" />
+            <Input value={jobTitleForCv} onChange={(e) => setCvJobTitle(e.target.value)} placeholder="Type the job title, e.g. Senior Accountant" required />
           </Field>
           <CvEditorPanel
             input={{ candidateName, jobTitle: jobTitleForCv, originalCvUrl: app.originalCvUrl, ...details }}
@@ -239,6 +251,10 @@ function SendToClientTeamForm({ app, onDone }: { app: Application; onDone: (appI
             onRevised={({ file, details: d, warnings: w }: RevisedCv) => {
               setRevised(file)
               setWarnings(w)
+              // Into the candidate's history: when the PM generated the revised CV.
+              perform(app.id, { kind: 'cv_generated', fileName: file.name }).catch((e: Error) =>
+                setError(`The revised CV is ready, but it could not be written in the history: ${e.message}`),
+              )
               // If the PM opened the editor and changed something there, keep the form in step.
               if (d?.candidateName) setCandidateName(d.candidateName)
               // Only the CV-detail fields; the job stays as chosen in this form.
@@ -305,10 +321,21 @@ function SendToClientTeamForm({ app, onDone }: { app: Application; onDone: (appI
         />
       </Field>
 
+      <Field label="Reason for selection" required hint="Why this candidate is a fit for the job — it is written in the candidate’s history.">
+        <Textarea
+          rows={2}
+          value={reason}
+          onChange={(e) => setReason(e.target.value)}
+          placeholder="e.g. 5 years of GST filing, matches the salary range, can join in 30 days."
+          required
+        />
+      </Field>
+
       {error && <Alert>{error}</Alert>}
       <div className="flex flex-wrap items-center justify-end gap-3">
         {busy && <span className="text-sm text-slate-500">{step} Please wait — don’t close this window.</span>}
-        <Button type="submit" busy={busy}>
+        {!busy && blocker && <span className="text-sm font-medium text-amber-700">⚠ To send: {blocker}</span>}
+        <Button type="submit" busy={busy} disabled={!!blocker} title={blocker ?? undefined}>
           {busy ? 'Sending…' : `Send to Client Team${client ? ` (${nameOf(client.assignedClientTeam)})` : ''}`}
         </Button>
       </div>
@@ -368,7 +395,7 @@ function RevisedCvReview({ url, name, warnings, onConfirm, onClose }: { url: str
             <b>Look carefully at:</b> {warnings.join(' · ')}
           </div>
         )}
-        <iframe src={url} title="Revised CV" className="min-h-0 w-full flex-1 bg-slate-100" />
+        <iframe src={url.startsWith('blob:') ? `${url}#navpanes=0&pagemode=none&view=FitH` : url} title="Revised CV" className="min-h-0 w-full flex-1 bg-slate-100" />
         <footer className="flex flex-wrap items-center justify-end gap-3 border-t border-slate-200 px-4 py-3">
           <p className="mr-auto text-sm font-semibold text-slate-700">Read the whole CV. You can’t send it to the Client Team until you confirm.</p>
           <Button type="button" variant="secondary" onClick={close(onClose)}>

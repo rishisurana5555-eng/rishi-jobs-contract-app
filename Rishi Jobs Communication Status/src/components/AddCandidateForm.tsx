@@ -1,22 +1,37 @@
-import { useState, type FormEvent } from 'react'
-import { extractCvFacts, type CvFacts } from '../cv/extract'
+import { useEffect, useMemo, useState, type FormEvent } from 'react'
 import { useApp } from '../context/AppContext'
 import type { CandidateProfile } from '../types'
 import { properName } from '../workflow/names'
 import { ClientJobFields } from './ClientJobFields'
 import { blankCvDetails, cvDetailsProblem, CvDetailsFields, type CvDetails } from './CvDetailsFields'
-import { altPhoneProblem, displayPhone, duplicatePhoneMessage, phoneProblem, PhoneInput } from './PhoneInput'
-import { Suggestion } from './Suggestion'
+import { altPhoneProblem, duplicatePhoneMessage, phoneProblem, PhoneInput } from './PhoneInput'
 import { UploadNote } from './UploadNote'
 import { useBackgroundUpload } from './useBackgroundUpload'
 import { usePhoneTaken } from './usePhoneTaken'
-import { Alert, Button, Field, Input, Spin, Textarea } from './ui'
+import { Alert, Button, Field, Input, Textarea, cx } from './ui'
 
-type Reading = 'idle' | 'reading' | 'done' | 'nothing' | 'failed'
+/** A Google Drive file link as a page that can be shown inside the app (other links as they are). */
+const viewableUrl = (url: string) => {
+  const id = url.match(/drive\.google\.com\/(?:file\/d\/|open\?id=)([A-Za-z0-9_-]{10,})/)?.[1]
+  return id ? `https://drive.google.com/file/d/${id}/preview` : url
+}
 
 /**
- * PE adds a candidate for a job opening assigned to them; it goes to that job's PM. Step 1 is the original CV: its common details are read off
- * it and filled in below (all editable). The PM then revises the CV and sends it to the Client Team.
+ * Opens the PDF without the page thumbnails down the side (more room for the CV itself), fitted to
+ * the width. Google Drive's own preview has no thumbnails and ignores this.
+ */
+const noThumbnails = (url: string) => (url.includes('#') ? url : `${url}#navpanes=0&pagemode=none&view=FitH`)
+
+/** The CV in a window of its own, on the left half of the screen, for someone who prefers that. */
+function openCvWindow(url: string) {
+  const w = Math.round(window.screen.availWidth / 2)
+  window.open(url, 'rj-candidate-cv', `popup,width=${w},height=${window.screen.availHeight},left=0,top=0`)
+}
+
+/**
+ * PE adds a candidate for a job opening assigned to them; it goes to that job's PM. Step 1 is the
+ * original CV: as soon as it is chosen it opens beside the form, and the PE reads it and types the
+ * details in by hand (nothing is filled in from it). The PM then revises the CV and sends it to the Client Team.
  * With `existing`, an existing candidate is sent to another client: their details and saved CV are
  * used, so only the client, job and message are new. The candidate's available dates are written
  * in the message to the PM.
@@ -26,7 +41,6 @@ export function AddCandidateForm({ onDone, existing, jobId }: { onDone: (appId: 
   const [cvFile, setCvFile] = useState<File | null>(null)
   // Uploads to Drive as soon as the CV is picked (while the PE checks the form), so Send only has to save.
   const upload = useBackgroundUpload(cvFile)
-  const [reading, setReading] = useState<Reading>('idle')
   const [candidateName, setCandidateName] = useState(existing?.candidateName ?? '')
   const [contact, setContact] = useState(existing?.candidateContactNumber ?? '')
   /** optional second number */
@@ -51,32 +65,18 @@ export function AddCandidateForm({ onDone, existing, jobId }: { onDone: (appId: 
   /** what the Send button is doing right now */
   const [step, setStep] = useState('')
   const [error, setError] = useState<string | null>(null)
-  /** details read from the CV, offered under their fields as suggestions (never filled in by themselves) */
-  const [suggested, setSuggested] = useState<CvFacts>({})
-  /** the CV's phone number was hidden, incomplete or missing */
-  const [phoneWarning, setPhoneWarning] = useState<string | null>(null)
+  // The CV shown beside the form: the file just chosen, or the existing candidate's saved CV.
+  const fileUrl = useMemo(() => (cvFile ? URL.createObjectURL(cvFile) : null), [cvFile])
+  useEffect(() => () => void (fileUrl && URL.revokeObjectURL(fileUrl)), [fileUrl])
+  const cvUrl = fileUrl ? noThumbnails(fileUrl) : existing?.originalCvUrl ? viewableUrl(existing.originalCvUrl) : null
 
-  async function pickCv(file: File | null) {
-    setCvFile(file)
+  function pickCv(file: File | null) {
     setError(null)
-    setPhoneWarning(null)
-    setSuggested({})
-    if (!file) return setReading('idle')
-    if (!/\.pdf$/i.test(file.name) && file.type !== 'application/pdf') {
+    if (file && !/\.pdf$/i.test(file.name) && file.type !== 'application/pdf') {
       setCvFile(null)
       return setError('Please upload the CV as a PDF — the CV editor that makes the revised CV reads PDFs only.')
     }
-    setReading('reading')
-    try {
-      const facts = await extractCvFacts(file)
-      const { phoneWarning: warning, ...found } = facts
-      setSuggested({ ...found, candidateName: found.candidateName && properName(found.candidateName) })
-      setPhoneWarning(warning ?? null)
-      setReading(Object.values(found).some(Boolean) ? 'done' : 'nothing')
-    } catch (e) {
-      console.error(e)
-      setReading('failed')
-    }
+    setCvFile(file)
   }
 
   async function submit(e: FormEvent) {
@@ -135,7 +135,23 @@ export function AddCandidateForm({ onDone, existing, jobId }: { onDone: (appId: 
   }
 
   return (
-    <form onSubmit={submit} className="space-y-4">
+    <div className={cx(cvUrl ? 'grid gap-4 lg:grid-cols-2' : 'mx-auto max-w-3xl')}>
+      {cvUrl && (
+        // The full-screen modal's body scrolls; the CV stays put at its full height while the form scrolls.
+        <aside
+          className="flex h-[80vh] flex-col overflow-hidden rounded-lg border border-slate-300 bg-slate-100 lg:sticky lg:top-0 lg:h-[calc(100vh-5.25rem)]"
+          aria-label="Candidate’s CV"
+        >
+          <div className="flex items-center justify-between gap-2 border-b border-slate-300 bg-white px-3 py-1.5 text-xs">
+            <span className="truncate font-semibold text-slate-700">📄 {cvFile?.name ?? existing?.originalCvName ?? 'Candidate’s CV'} — read it and fill in the form</span>
+            <button type="button" onClick={() => openCvWindow(cvUrl)} className="shrink-0 font-medium text-brand-700 underline">
+              Open in a separate window ↗
+            </button>
+          </div>
+          <iframe src={cvUrl} title="Candidate’s CV" className="min-h-0 w-full flex-1" />
+        </aside>
+      )}
+    <form onSubmit={submit} className="min-w-0 space-y-4">
       {noJobs && <Alert tone="warn">No open job opening is assigned to you yet, so you can’t send candidates. Your PM assigns job openings to you.</Alert>}
 
       {existing ? (
@@ -157,15 +173,9 @@ export function AddCandidateForm({ onDone, existing, jobId }: { onDone: (appId: 
           <Input type="file" accept=".pdf,application/pdf" onChange={(e) => void pickCv(e.target.files?.[0] ?? null)} autoFocus />
         </Field>
         <p className="mt-1.5 text-xs text-slate-600">
-          {reading === 'idle' && 'Upload the CV first — the name, phone, email and any salary / notice period found in it are suggested under their fields.'}
-          {reading === 'reading' && (
-            <span className="inline-flex items-center gap-2 font-medium text-brand-700">
-              <Spin /> Reading the CV for suggestions…
-            </span>
-          )}
-          {reading === 'done' && '✓ Details read from the CV are shown as suggestions under their fields.'}
-          {reading === 'nothing' && 'No details could be read from this CV (it may be a scan). Please fill them in below.'}
-          {reading === 'failed' && 'This PDF could not be read. You can still fill in the details below by hand.'}
+          {cvFile
+            ? '✓ The CV is open beside this form — read it and type the candidate’s details in below.'
+            : 'Upload the CV first — it opens beside the form so you can read it while you fill in the details.'}
         </p>
         {cvFile && (
           <p className="mt-1 text-xs">
@@ -175,39 +185,17 @@ export function AddCandidateForm({ onDone, existing, jobId }: { onDone: (appId: 
       </section>
       )}
 
-      {reading === 'done' && (
-        <div role="alert" className="rounded-lg border-2 border-amber-400 bg-amber-50 px-4 py-3 text-amber-950">
-          <p className="text-base font-bold">⚠ Check each suggestion against the CV before you use it.</p>
-          <p className="mt-1 text-sm font-bold">
-            Under the fields below you’ll see “Suggestion:” with a value read automatically from the CV. It may be wrong or incomplete. If it is
-            correct, click it to fill it in; otherwise type the right value yourself.
-          </p>
-        </div>
-      )}
-
       {hasCv && (
         <>
           <div className="grid gap-3 sm:grid-cols-2">
             <Field label="Candidate name" required group>
               <Input value={candidateName} onChange={(e) => setCandidateName(e.target.value)} onBlur={() => setCandidateName(properName)} required aria-label="Candidate name" />
-              <Suggestion value={suggested.candidateName} current={candidateName} onUse={() => setCandidateName(suggested.candidateName!)} />
             </Field>
             <Field label="Candidate contact number" required group>
               <PhoneInput value={contact} onChange={setContact} required />
-              <Suggestion
-                value={suggested.candidateContactNumber && displayPhone(suggested.candidateContactNumber)}
-                current={displayPhone(contact)}
-                onUse={() => setContact(suggested.candidateContactNumber!)}
-              />
               {contactTaken && (
                 <div className="mt-1.5">
                   <Alert>⚠ {duplicatePhoneMessage(contactTaken, me.id)}</Alert>
-                </div>
-              )}
-              {/* Until a valid number is typed in. */}
-              {phoneWarning && phoneProblem(contact) && (
-                <div className="mt-1.5">
-                  <Alert tone="warn">⚠ {phoneWarning}</Alert>
                 </div>
               )}
             </Field>
@@ -221,7 +209,6 @@ export function AddCandidateForm({ onDone, existing, jobId }: { onDone: (appId: 
             </Field>
             <Field label="Candidate email" group>
               <Input type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="name@example.com" aria-label="Candidate email" />
-              <Suggestion value={suggested.candidateEmail} current={email} onUse={() => setEmail(suggested.candidateEmail!)} />
             </Field>
             <ClientJobFields clientId={place.clientId} jobId={place.jobId} onChange={setPlace} keepJobId={jobId} />
             <Field label="PM for this job">
@@ -229,7 +216,7 @@ export function AddCandidateForm({ onDone, existing, jobId }: { onDone: (appId: 
             </Field>
           </div>
 
-          <CvDetailsFields value={details} onChange={setDetails} noteHint={false} suggestions={suggested} />
+          <CvDetailsFields value={details} onChange={setDetails} noteHint={false} />
 
           <Field
             label="Candidate available interview dates & message to the PM"
@@ -255,5 +242,6 @@ export function AddCandidateForm({ onDone, existing, jobId }: { onDone: (appId: 
         </Button>
       </div>
     </form>
+    </div>
   )
 }

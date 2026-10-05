@@ -1,17 +1,21 @@
 import { useState, type FormEvent } from 'react'
 import { playSound } from '../alarm/sound'
 import { properName } from '../workflow/names'
+import { AllCatalogLog, CatalogLogModal } from '../components/CatalogLog'
 import { DeleteClientDialog } from '../components/DeleteDialogs'
 import { ToneBadge } from '../components/StatusBadge'
-import { Alert, Button, Card, Input, Select, Textarea } from '../components/ui'
+import { TimeSelect } from '../components/TimeSelect'
+import { Alert, Button, Card, Field, Input, Select, Textarea } from '../components/ui'
 import { useApp } from '../context/AppContext'
-import { isAdminRole, ROLE_LABELS, type AppUser, type Client, type JobOpening, type JobStatus, type Role } from '../types'
-import { jobStep, jobStepLabel } from '../workflow/jobs'
+import { canEditCatalog, isAdminRole, JOB_PRIORITY_LABEL, ROLE_LABELS, type AppUser, type Client, type JobOpening, type JobPriority, type JobStatus, type Role } from '../types'
+import { delegationLabel, dueLabel, priorityLabel } from '../workflow/catalog'
+import { toDateAndTime, toEpoch, todayIso } from '../workflow/dates'
+import { JOB_STATUS_LABEL, jobStep, jobStepLabel } from '../workflow/jobs'
 
 const ROLES: Role[] = ['SuperAdmin', 'Admin', 'PM', 'ClientTeam', 'PE']
 
 /** A new job opening for this client: it goes to the admins first, who assign the PM. */
-function newJob(client: Pick<Client, 'id' | 'name' | 'assignedClientTeam'>, { title, details, note }: JobDraft, me: AppUser): JobOpening {
+function newJob(client: Pick<Client, 'id' | 'name' | 'assignedClientTeam'>, { title, details, note, priority, dueDate, dueTime }: JobDraft, me: AppUser): JobOpening {
   const now = Date.now()
   return {
     id: '',
@@ -20,6 +24,9 @@ function newJob(client: Pick<Client, 'id' | 'name' | 'assignedClientTeam'>, { ti
     title: title.trim(),
     details: details.trim(),
     status: 'open',
+    priority,
+    submitBy: draftSubmitBy({ dueDate, dueTime }),
+    delegation: null,
     assignedClientTeam: client.assignedClientTeam,
     assignedPM: null,
     pmAssignedAt: null,
@@ -37,8 +44,46 @@ function newJob(client: Pick<Client, 'id' | 'name' | 'assignedClientTeam'>, { ti
   }
 }
 
-type JobDraft = { title: string; details: string; note: string }
-const blankJobDraft = (): JobDraft => ({ title: '', details: '', note: '' })
+/** dueDate (YYYY-MM-DD) + dueTime (HH:MM): the optional "submissions due by" deadline; both empty = none. */
+type JobDraft = { title: string; details: string; note: string; priority: JobPriority; dueDate: string; dueTime: string }
+const blankJobDraft = (): JobDraft => ({ title: '', details: '', note: '', priority: 'active', dueDate: '', dueTime: '' })
+
+const draftSubmitBy = ({ dueDate, dueTime }: Pick<JobDraft, 'dueDate' | 'dueTime'>) => (dueDate && dueTime ? toEpoch(dueDate, dueTime) : null)
+const dueDraft = (submitBy: number | null | undefined) => (submitBy ? { dueDate: toDateAndTime(submitBy).date, dueTime: toDateAndTime(submitBy).time } : { dueDate: '', dueTime: '' })
+
+/** What is wrong with the deadline as entered (null: fine). An unchanged deadline may already have passed. */
+function dueError(draft: Pick<JobDraft, 'dueDate' | 'dueTime'>, saved: number | null | undefined) {
+  if (!draft.dueDate !== !draft.dueTime) return draft.dueDate ? 'Choose the time too.' : 'Choose the date too.'
+  const at = draftSubmitBy(draft)
+  if (at && at !== (saved ?? null) && at <= Date.now()) return 'The deadline must be later than now.'
+  return null
+}
+
+/** "Submissions due by": a date and a 12-hour time, both optional together. */
+function DueByField({ draft, onChange }: { draft: Pick<JobDraft, 'dueDate' | 'dueTime'>; onChange: (v: Pick<JobDraft, 'dueDate' | 'dueTime'>) => void }) {
+  return (
+    <Field label="Submissions due by (optional)">
+      <div className="flex flex-wrap items-center gap-2">
+        <Input type="date" min={todayIso()} value={draft.dueDate} onChange={(e) => onChange({ ...draft, dueDate: e.target.value })} className="w-40" aria-label="Due date" />
+        <TimeSelect label="Due time" value={draft.dueTime} onChange={(dueTime) => onChange({ ...draft, dueTime })} />
+        {(draft.dueDate || draft.dueTime) && (
+          <Button type="button" variant="ghost" className="px-2 py-1 text-xs" onClick={() => onChange({ dueDate: '', dueTime: '' })}>
+            Clear
+          </Button>
+        )}
+      </div>
+    </Field>
+  )
+}
+
+/** Compulsory with every edit of a client / job opening: it goes into the log and the alert. */
+function ReasonField({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  return (
+    <Field label="Reason for editing" required hint="Written in the log and sent with the alert to the admins and the PM / PE on the job openings.">
+      <Textarea rows={2} value={value} onChange={(e) => onChange(e.target.value)} placeholder="e.g. The client changed the job title in their latest mail." required />
+    </Field>
+  )
+}
 
 function useSaver() {
   const [error, setError] = useState<string | null>(null)
@@ -60,6 +105,22 @@ function useSaver() {
   return { error, busy, save }
 }
 
+/**
+ * Adding and editing clients and job openings is the Client Team's work: an Admin may only once the
+ * Super Admin allows it (read from the live team list, so it applies at once).
+ */
+function useCanEditCatalog() {
+  const { me, users } = useApp()
+  return canEditCatalog(users.find((u) => u.id === me.id) ?? me)
+}
+
+const NOT_ALLOWED = 'Adding and editing clients and job openings is the Client Team’s work. Ask the Super Admin to allow you.'
+
+/** Said on the Clients / Job openings cards to an Admin who may not add or edit them. */
+function NotAllowedNote() {
+  return <p className="mb-2 rounded-lg bg-slate-50 px-3 py-2 text-xs text-slate-500">🔒 {NOT_ALLOWED}</p>
+}
+
 /** Clients (and their Client Team member) and job openings; Admins also get the Team section. */
 export function SetupPage({ includeTeam = true }: { includeTeam?: boolean }) {
   return (
@@ -71,55 +132,77 @@ export function SetupPage({ includeTeam = true }: { includeTeam?: boolean }) {
           <TeamCard />
         </div>
       )}
+      <LogCard />
+    </div>
+  )
+}
+
+/** Admins: everything added, edited, assigned or deleted in clients and job openings. */
+function LogCard() {
+  const { me } = useApp()
+  const [open, setOpen] = useState(false)
+  if (!isAdminRole(me.role)) return null
+  return (
+    <div className="lg:col-span-2">
+      <Card
+        title="Clients & job openings log"
+        actions={
+          <Button variant="secondary" className="py-1 text-xs" onClick={() => setOpen((o) => !o)}>
+            {open ? 'Hide' : 'Show log'}
+          </Button>
+        }
+      >
+        {open ? <AllCatalogLog /> : <p className="text-sm text-slate-500">Every client and job opening added, edited (with the reason), assigned or deleted — with date, time and who did it.</p>}
+      </Card>
     </div>
   )
 }
 
 function ClientsCard() {
-  const { clients, users, backend, nameOf, me } = useApp()
+  const { clients, users, backend, nameOf, names, me } = useApp()
   const cts = users.filter((u) => u.role === 'ClientTeam')
   const [editing, setEditing] = useState<Client | null>(null)
+  const [reason, setReason] = useState('')
   const [deleting, setDeleting] = useState<Client | null>(null)
-  /** job openings typed in with a new client */
-  const [newJobs, setNewJobs] = useState<JobDraft[]>([])
+  const [logOf, setLogOf] = useState<Client | null>(null)
   const { error, busy, save } = useSaver()
+  const canEdit = useCanEditCatalog()
+  // Deleting a client takes its job openings and submissions with it: the Super Admin only.
+  const canDelete = me.role === 'SuperAdmin'
 
   // A Client Team member adding a client looks after it themselves unless they pick someone else.
   const blank = (): Client => ({ id: '', name: '', contactPerson: '', assignedClientTeam: me.role === 'ClientTeam' ? me.id : (cts[0]?.id ?? '') })
+  const startEditing = (c: Client) => {
+    setEditing(c)
+    setReason('')
+  }
 
   async function submit(e: FormEvent) {
     e.preventDefault()
     if (!editing) return
-    const jobsToAdd = editing.id ? [] : newJobs.filter((j) => j.title.trim())
     const c = {
       ...editing,
       name: editing.name.trim(),
       contactPerson: editing.contactPerson.trim(),
-      // A new client says how many job openings come with it, so the admins are alerted at once with the right message.
-      ...(editing.id ? {} : { createdAt: Date.now(), createdBy: me.id, createdByName: me.name, jobsAtCreation: jobsToAdd.length }),
+      ...(editing.id ? {} : { createdAt: Date.now(), createdBy: me.id, createdByName: me.name }),
     }
     if (!c.name || !c.assignedClientTeam) return
-    const ok = await save(async () => {
-      const id = await backend.saveClient(c)
-      // Each job opening goes to the admins, who assign it to a PM.
-      for (const j of jobsToAdd) await backend.saveJob(newJob({ ...c, id }, j, me))
-    })
-    if (ok) {
-      setEditing(null)
-      setNewJobs([])
-    }
+    if (await save(async () => void (await backend.saveClient(c, { by: me, reason, names })))) setEditing(null)
   }
-
-  const startAdding = () => {
-    setEditing(blank())
-    setNewJobs([blankJobDraft()])
-  }
-  const setNewJob = (i: number, patch: Partial<JobDraft>) => setNewJobs((list) => list.map((j, k) => (k === i ? { ...j, ...patch } : j)))
 
   return (
-    <Card title="Clients" actions={<Button variant="secondary" className="py-1 text-xs" onClick={startAdding}>＋ Add client</Button>}>
-      {editing && (
+    <Card
+      title="Clients"
+      actions={
+        <Button variant="secondary" className="py-1 text-xs" onClick={() => startEditing(blank())} disabled={!canEdit} title={canEdit ? undefined : NOT_ALLOWED}>
+          ＋ Add client
+        </Button>
+      }
+    >
+      {!canEdit && <NotAllowedNote />}
+      {editing && canEdit && (
         <form onSubmit={submit} className="mb-4 space-y-2 rounded-lg bg-slate-50 p-3">
+          <div className="text-sm font-semibold text-slate-700">{editing.id ? `Edit client ${editing.id}` : 'New client'}</div>
           <Input placeholder="Client name" value={editing.name} onChange={(e) => setEditing({ ...editing, name: e.target.value })} required />
           <Input placeholder="Contact person" value={editing.contactPerson} onChange={(e) => setEditing({ ...editing, contactPerson: e.target.value })} />
           <Select value={editing.assignedClientTeam} onChange={(e) => setEditing({ ...editing, assignedClientTeam: e.target.value })} required>
@@ -131,29 +214,7 @@ function ClientsCard() {
             ))}
           </Select>
           <p className="text-xs text-slate-500">New submissions for this client go to this Client Team member.</p>
-          {!editing.id && (
-            <div className="space-y-2 border-t border-slate-200 pt-2">
-              <div className="text-sm font-semibold text-slate-700">Job openings</div>
-              {newJobs.map((j, i) => (
-                <div key={i} className="space-y-1.5 rounded-lg border border-slate-200 bg-white p-2">
-                  <div className="flex gap-2">
-                    <Input placeholder={`Job title ${i + 1}`} value={j.title} onChange={(e) => setNewJob(i, { title: e.target.value })} />
-                    {newJobs.length > 1 && (
-                      <Button type="button" variant="ghost" className="py-1 text-xs" onClick={() => setNewJobs((list) => list.filter((_, k) => k !== i))}>
-                        Remove
-                      </Button>
-                    )}
-                  </div>
-                  <Textarea rows={3} placeholder="Job details — requirements, experience, location, salary, number of openings…" value={j.details} onChange={(e) => setNewJob(i, { details: e.target.value })} />
-                  <Input placeholder="Note for the admins (optional)" value={j.note} onChange={(e) => setNewJob(i, { note: e.target.value })} />
-                </div>
-              ))}
-              <Button type="button" variant="secondary" className="py-1 text-xs" onClick={() => setNewJobs((list) => [...list, blankJobDraft()])}>
-                ＋ Another job opening
-              </Button>
-              <p className="text-xs text-slate-500">The client and its job openings go to the admins, who assign each job opening to a PM.</p>
-            </div>
-          )}
+          {editing.id && <ReasonField value={reason} onChange={setReason} />}
           {error && <Alert>{error}</Alert>}
           <div className="flex gap-2">
             <Button type="submit" busy={busy}>Save</Button>
@@ -171,56 +232,107 @@ function ClientsCard() {
               </div>
             </div>
             <div className="flex shrink-0 gap-1">
-              <Button variant="ghost" className="py-1 text-xs" onClick={() => setEditing(c)}>Edit</Button>
-              <Button variant="ghost" className="py-1 text-xs text-red-600 hover:bg-red-50" onClick={() => setDeleting(c)}>Delete</Button>
+              <Button variant="ghost" className="py-1 text-xs" onClick={() => startEditing(c)} disabled={!canEdit} title={canEdit ? undefined : NOT_ALLOWED}>Edit</Button>
+              <Button variant="ghost" className="py-1 text-xs" onClick={() => setLogOf(c)}>Log</Button>
+              {canDelete && (
+                <Button variant="ghost" className="py-1 text-xs text-red-600 hover:bg-red-50" onClick={() => setDeleting(c)}>Delete</Button>
+              )}
             </div>
           </li>
         ))}
       </ul>
-      {deleting && <DeleteClientDialog client={deleting} onClose={() => setDeleting(null)} />}
+      {canDelete && deleting && <DeleteClientDialog client={deleting} onClose={() => setDeleting(null)} />}
+      {logOf && <CatalogLogModal kind="client" id={logOf.id} title={`${logOf.name} (${logOf.id})`} onClose={() => setLogOf(null)} />}
     </Card>
   )
 }
 
+type JobForm = JobDraft & { id: string; clientId: string; status: JobStatus; reason: string }
+
 function JobsCard() {
   const { clients, jobs, backend, me, names } = useApp()
   /** a job opening being added (empty id) or edited */
-  const [draft, setDraft] = useState<(JobDraft & { id: string; clientId: string }) | null>(null)
+  const [draft, setDraft] = useState<JobForm | null>(null)
+  const [logOf, setLogOf] = useState<JobOpening | null>(null)
   const { error, busy, save } = useSaver()
   const clientName = (id: string) => clients.find((c) => c.id === id)?.name ?? id
+  const draftDueError = draft && dueError(draft, jobs.find((j) => j.id === draft.id)?.submitBy)
+  const canEdit = useCanEditCatalog()
 
   async function submit(e: FormEvent) {
     e.preventDefault()
     if (!draft || !draft.title.trim() || !draft.clientId) return
     const existing = jobs.find((j) => j.id === draft.id)
+    if (dueError(draft, existing?.submitBy)) return
     const client = clients.find((c) => c.id === draft.clientId)
     if (!existing && !client) return
-    const job = existing ? { ...existing, title: draft.title.trim(), details: draft.details.trim() } : newJob(client!, draft, me)
-    if (await save(() => backend.saveJob(job))) setDraft(null)
+    const job = existing
+      ? { ...existing, title: draft.title.trim(), details: draft.details.trim(), status: draft.status, priority: draft.priority, submitBy: draftSubmitBy(draft) }
+      : newJob(client!, draft, me)
+    if (await save(() => backend.saveJob(job, { by: me, reason: draft.reason }))) setDraft(null)
   }
 
   return (
     <Card
       title="Job openings"
-      actions={<Button variant="secondary" className="py-1 text-xs" onClick={() => setDraft({ id: '', clientId: '', ...blankJobDraft() })}>＋ Add job</Button>}
+      actions={
+        <Button
+          variant="secondary"
+          className="py-1 text-xs"
+          onClick={() => setDraft({ id: '', clientId: '', status: 'open', reason: '', ...blankJobDraft() })}
+          disabled={!canEdit}
+          title={canEdit ? undefined : NOT_ALLOWED}
+        >
+          ＋ Add job
+        </Button>
+      }
     >
-      {draft && (
+      {!canEdit && <NotAllowedNote />}
+      {draft && canEdit && (
         <form onSubmit={submit} className="mb-4 space-y-2 rounded-lg bg-slate-50 p-3">
+          <div className="text-sm font-semibold text-slate-700">{draft.id ? `Edit job opening ${draft.id}` : 'New job opening'}</div>
           <Select value={draft.clientId} onChange={(e) => setDraft({ ...draft, clientId: e.target.value })} required disabled={!!draft.id}>
             <option value="">— Client —</option>
-            {clients.map((c) => (
-              <option key={c.id} value={c.id}>
-                {c.name}
-              </option>
-            ))}
+            {[...clients]
+              .sort((a, b) => a.name.localeCompare(b.name))
+              .map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.name}
+                </option>
+              ))}
           </Select>
           <Input placeholder="Job title" value={draft.title} onChange={(e) => setDraft({ ...draft, title: e.target.value })} required />
           <Textarea rows={4} placeholder="Job details — requirements, experience, location, salary, number of openings…" value={draft.details} onChange={(e) => setDraft({ ...draft, details: e.target.value })} />
+          <div className="grid gap-2 sm:grid-cols-2">
+            <Field label="Job status" required>
+              <Select value={draft.priority} onChange={(e) => setDraft({ ...draft, priority: e.target.value as JobPriority })} required>
+                {(Object.keys(JOB_PRIORITY_LABEL) as JobPriority[]).map((p) => (
+                  <option key={p} value={p}>
+                    {JOB_PRIORITY_LABEL[p]}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+            {draft.id && (
+              <Field label="Open / on hold / closed">
+                <Select value={draft.status} onChange={(e) => setDraft({ ...draft, status: e.target.value as JobStatus })}>
+                  {(Object.keys(JOB_STATUS_LABEL) as JobStatus[]).map((st) => (
+                    <option key={st} value={st}>
+                      {JOB_STATUS_LABEL[st]}
+                    </option>
+                  ))}
+                </Select>
+              </Field>
+            )}
+          </div>
+          <DueByField draft={draft} onChange={(due) => setDraft({ ...draft, ...due })} />
+          {draftDueError && <p className="text-xs text-red-600">{draftDueError}</p>}
           {!draft.id && <Input placeholder="Note for the admins (optional)" value={draft.note} onChange={(e) => setDraft({ ...draft, note: e.target.value })} />}
           {!draft.id && <p className="text-xs text-slate-500">The job opening goes to the admins, who assign it to a PM.</p>}
+          {draft.id && <ReasonField value={draft.reason} onChange={(reason) => setDraft({ ...draft, reason })} />}
           {error && <Alert>{error}</Alert>}
           <div className="flex gap-2">
-            <Button type="submit" busy={busy}>Save</Button>
+            <Button type="submit" busy={busy} disabled={!!draftDueError}>Save</Button>
             <Button type="button" variant="ghost" onClick={() => setDraft(null)}>Cancel</Button>
           </div>
         </form>
@@ -232,27 +344,31 @@ function JobsCard() {
             <li key={j.id} className="flex items-center justify-between gap-2 py-2">
               <div className="min-w-0">
                 <div className="font-medium">{j.title} <span className="text-xs font-normal text-slate-400">{j.id}</span></div>
-                <div className="text-xs text-slate-500">{j.clientName || clientName(j.clientId)}</div>
+                <div className="text-xs text-slate-500">
+                  {j.clientName || clientName(j.clientId)} · {JOB_STATUS_LABEL[j.status]} · {priorityLabel(j.priority)}
+                  {j.delegation ? ` · ${delegationLabel(j.delegation)}` : ''}
+                  {j.submitBy ? ` · Due by ${dueLabel(j.submitBy)}` : ''}
+                </div>
                 <ToneBadge tone={jobStep(j) === 'with_pe' ? 'green' : 'yellow'} className="mt-1">{jobStepLabel(j, names)}</ToneBadge>
               </div>
               <div className="flex shrink-0 items-center gap-1">
-                <Button variant="ghost" className="py-1 text-xs" onClick={() => setDraft({ id: j.id, clientId: j.clientId, title: j.title, details: j.details ?? '', note: '' })}>
+                <Button
+                  variant="ghost"
+                  className="py-1 text-xs"
+                  disabled={!canEdit}
+                  title={canEdit ? undefined : NOT_ALLOWED}
+                  onClick={() =>
+                    setDraft({ id: j.id, clientId: j.clientId, title: j.title, details: j.details ?? '', note: '', priority: j.priority ?? 'active', ...dueDraft(j.submitBy), status: j.status, reason: '' })
+                  }
+                >
                   Edit
                 </Button>
-                <Select
-                  value={j.status}
-                  onChange={(e) => void save(() => backend.saveJob({ ...j, status: e.target.value as JobStatus }))}
-                  disabled={busy}
-                  className="w-auto py-1 text-xs"
-                >
-                  <option value="open">Open</option>
-                  <option value="on-hold">On hold</option>
-                  <option value="closed">Closed</option>
-                </Select>
+                <Button variant="ghost" className="py-1 text-xs" onClick={() => setLogOf(j)}>Log</Button>
               </div>
             </li>
           ))}
       </ul>
+      {logOf && <CatalogLogModal kind="job" id={logOf.id} title={`${logOf.title} (${logOf.id}) at ${logOf.clientName}`} onClose={() => setLogOf(null)} />}
     </Card>
   )
 }
@@ -286,6 +402,8 @@ function TeamCard() {
       contactNumber: draft.contactNumber.trim(),
       email: draft.email.trim().toLowerCase(),
       reportsTo: draft.role === 'PE' ? (draft.reportsTo ?? null) : null,
+      // Only an Admin is ever allowed to add and edit clients and job openings (set by the Super Admin).
+      canEditCatalog: draft.role === 'Admin' && draft.canEditCatalog === true,
     }
     if (isNew) {
       if (!/^[a-z0-9._-]{3,30}$/.test(u.userId)) return void alert('User ID: 3–30 characters, letters/numbers/dot/dash only (e.g. shubham).')
@@ -337,6 +455,12 @@ function TeamCard() {
               Active (untick to block this person from logging in)
             </label>
           )}
+          {superAdmin && draft.role === 'Admin' && (
+            <label className="flex items-center gap-2 text-sm sm:col-span-3">
+              <input type="checkbox" checked={draft.canEditCatalog === true} onChange={(e) => setDraft({ ...draft, canEditCatalog: e.target.checked })} />
+              Allow to add and edit clients and job openings (otherwise the Client Team’s work only)
+            </label>
+          )}
           {isNew && <p className="text-xs text-slate-500 sm:col-span-3">A password is generated and shown to you once after saving.</p>}
           <div className="flex gap-2 sm:col-span-3">
             <Button type="submit" busy={busy}>{busy ? 'Saving…' : isNew ? 'Create login' : 'Save'}</Button>
@@ -368,7 +492,10 @@ function TeamCard() {
                 <td className="py-2 pr-3">{u.contactNumber || '—'}</td>
                 <td className="py-2 pr-3">{u.email || '—'}</td>
                 <td className="py-2 pr-3">{u.role === 'PE' ? (pms.find((p) => p.id === u.reportsTo)?.name ?? '—') : '—'}</td>
-                <td className="py-2 pr-3">{u.active === false ? 'Deactivated' : 'Active'}</td>
+                <td className="py-2 pr-3">
+                  {u.active === false ? 'Deactivated' : 'Active'}
+                  {u.role === 'Admin' && u.canEditCatalog && <div className="text-[11px] text-slate-500">Can add / edit clients & jobs</div>}
+                </td>
                 <td className="py-2 text-right">
                   {canEdit(u) ? (
                     <Button variant="ghost" className="py-1 text-xs" onClick={() => setDraft({ ...blankUser(), ...u })}>Edit</Button>
@@ -381,10 +508,6 @@ function TeamCard() {
           </tbody>
         </table>
       </div>
-      <p className="mt-2 text-xs text-slate-500">
-        Passwords are kept only in Firebase Authentication, never in this table. To reset one, run <code>npm run users -- reset &lt;userId&gt;</code>.
-        {!superAdmin && ' Only the Super Admin can add or change Admin accounts.'}
-      </p>
     </Card>
   )
 }

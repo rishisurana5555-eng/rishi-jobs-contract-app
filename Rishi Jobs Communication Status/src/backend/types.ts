@@ -1,4 +1,5 @@
-import type { AdminMessage, AppUser, JobNote, Application, AvailabilityRound, CandidateProfile, Client, Interview, JobOpening, TimelineEntry } from '../types'
+import type { AdminMessage, AppUser, JobNote, Application, AvailabilityRound, CandidateProfile, CatalogLogEntry, Client, Delegation, Interview, JobOpening, TimelineEntry } from '../types'
+import type { Names } from '../workflow/workflow'
 import type { PhoneOwner } from '../components/PhoneInput'
 import type { Action, Actor } from '../workflow/engine'
 
@@ -10,6 +11,18 @@ export interface JobAssignment {
   userId: string | null
   by: Pick<AppUser, 'id' | 'name' | 'role'>
   note: string
+  /** the person's name, for the job opening's log */
+  userName?: string
+  /** Admin → PM: 1st / 2nd / 3rd delegation */
+  delegation?: Delegation
+}
+
+/** Who adds / edits a client or job opening, and why (the reason is compulsory for an edit). */
+export interface CatalogChange {
+  by: Pick<AppUser, 'id' | 'name' | 'role'>
+  reason?: string
+  /** people's names, for the log */
+  names?: Names
 }
 
 export interface DeleteResult {
@@ -61,7 +74,7 @@ export interface Backend {
   sendMessage(message: Omit<AdminMessage, 'id'>): Promise<void>
   markMessageRead(messageId: string, userId: string): Promise<void>
 
-  /** Candidate profiles the person may see: their own (PE / PM), or all (admins, Client Team). Live. */
+  /** Candidate profiles the person may see: their own (PE / PM), or all (admins); none for the Client Team. Live. */
   listenCandidates(me: AppUser, cb: (candidates: CandidateProfile[]) => void): Unsub
   /**
    * Which candidate already has this number (phoneIndex), or null. Anyone can look a number up, even
@@ -72,7 +85,7 @@ export interface Backend {
   findCandidateApps(candidateId: string, me: AppUser): Promise<Application[]>
   /**
    * Deletes the candidate everywhere: every submission with its whole history (timeline, dates,
-   * interviews), the profile, and moves their CV files to the Drive trash.
+   * interviews), the profile, and moves their CV files to the Drive trash. The Super Admin only.
    */
   deleteCandidate(candidateId: string, me: AppUser): Promise<DeleteResult>
   /** Submissions to this client's jobs (to show before deleting). */
@@ -81,15 +94,23 @@ export interface Backend {
    * Deletes a client: its job openings and every submission to it with its history (and the revised
    * CVs made for it). The candidates themselves are kept (their profiles).
    */
-  deleteClient(clientId: string): Promise<DeleteResult>
+  deleteClient(clientId: string, by: Pick<AppUser, 'id' | 'name' | 'role'>): Promise<DeleteResult>
 
   /**
-   * Saves a client; a new one gets the next CL- number and returns it. Changing the client's name or
-   * Client Team member is copied onto its job openings.
+   * Saves a client; a new one gets the next CL- number and returns it. An edit needs a reason and is
+   * stamped (lastEdit) on the client and its job openings, so the admins and their PM / PE are alerted.
+   * Changing the client's name or Client Team member is copied onto its job openings. Every save is logged.
    */
-  saveClient(client: Client): Promise<string>
-  /** A new job opening (empty id) gets the next JB- number; an existing one only has its title, details and status changed. */
-  saveJob(job: JobOpening): Promise<void>
+  saveClient(client: Client, change: CatalogChange): Promise<string>
+  /**
+   * A new job opening (empty id) gets the next JB- number; an existing one only has its title, details,
+   * status, priority and submission deadline changed, needs a reason, and is stamped (lastEdit). Every save is logged.
+   */
+  saveJob(job: JobOpening, change: CatalogChange): Promise<void>
+  /** A client's / job opening's log, newest first (live). */
+  listenCatalogLog(kind: 'client' | 'job', id: string, cb: (entries: CatalogLogEntry[]) => void): Unsub
+  /** Admins: every client's and job opening's log (also of deleted ones), newest first, once. */
+  loadAllCatalogLog(): Promise<CatalogLogEntry[]>
   /** Admin → PM (clears the PE) or PM → PE hand-down. */
   assignJob(jobId: string, change: JobAssignment): Promise<void>
   /** Adds a note to the job opening's notes (everyone on the job opening sees it). */

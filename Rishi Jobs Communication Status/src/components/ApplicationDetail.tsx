@@ -47,22 +47,31 @@ function Section({ title, children, highlight }: { title: string; children: Reac
   )
 }
 
-/** The revised CV; before the PM has revised it (a PE's candidate), the original CV. */
-export function CvLink({ app, className, original }: { app: Application; className?: string; original?: boolean }) {
+/**
+ * The revised CV; before the PM has revised it (a PE's candidate), the original CV. When the Client Team
+ * member on the candidate opens the revised CV, it is written in the candidate's history. `download`
+ * (the candidate's details): the link is labelled "Download CV" (it still opens the CV, as before).
+ */
+export function CvLink({ app, className, original, download }: { app: Application; className?: string; original?: boolean; download?: boolean }) {
+  const { me, perform } = useApp()
   const url = original ? app.originalCvUrl : app.revisedCvUrl || app.originalCvUrl
   if (!url) return <span className="text-slate-400">—</span>
   const isData = url.startsWith('data:')
   const isOriginal = original || !app.revisedCvUrl
+  const logDownload = !isOriginal && app.assignedClientTeam === me.id
   return (
     <a
       href={url}
       target="_blank"
       rel="noreferrer"
       download={isData ? ((isOriginal ? app.originalCvName : app.revisedCvName) ?? 'cv') : undefined}
-      onClick={(e) => e.stopPropagation()}
+      onClick={(e) => {
+        e.stopPropagation()
+        if (logDownload) perform(app.id, { kind: 'cv_downloaded' }).catch(() => {})
+      }}
       className={cx('font-medium text-brand-600 underline-offset-2 hover:underline', className)}
     >
-      {isOriginal ? 'Original CV' : isData ? 'Download CV' : 'Open CV'}
+      {isOriginal ? 'Original CV' : isData || download ? 'Download CV' : 'Open CV'}
     </a>
   )
 }
@@ -104,6 +113,17 @@ export function ApplicationDetail() {
   if (!selectedId) return null
   const side = app ? sideOf(app, me.id) : null
   const myTurn = !!app && isMyTurn(app, me.id, now)
+  /** the PM has an open doubt from the Client Team to answer */
+  const pmMustAnswerDoubt = !!app && side === 'PM' && !!app.ctDoubt && !isClosed(app.stage)
+  // A doubt between the Client Team and the PM (open or last answered); the Client Team can always raise one.
+  const doubtSection = app && (app.ctDoubt || app.lastCtDoubt || (side === 'ClientTeam' && !isClosed(app.stage) && !beforeClientTeam(app.stage))) && (
+    <Section
+      title={pmMustAnswerDoubt ? `⚠ ${app.ctDoubt!.byName} raised a doubt – please answer` : side === 'ClientTeam' ? `Doubt for ${nameOf(app.assignedPM)}` : 'Doubt from the Client Team'}
+      highlight={pmMustAnswerDoubt}
+    >
+      <CtDoubtPanel app={app} side={side} />
+    </Section>
+  )
 
   return (
     <div className="fixed inset-0 z-30 flex justify-end bg-slate-900/30" onMouseDown={() => openApp(null)}>
@@ -124,6 +144,8 @@ export function ApplicationDetail() {
                 </p>
               </div>
               <div className="flex shrink-0 items-center gap-1">
+                {/* Only the Super Admin can delete a candidate. */}
+                {me.role === 'SuperAdmin' && (
                 <button
                   onClick={() => setDeletingCandidate({ candidateId: app.candidateId, name: app.candidateName })}
                   className="rounded px-2 py-1 text-xs font-medium text-red-600 hover:bg-red-50"
@@ -131,6 +153,7 @@ export function ApplicationDetail() {
                 >
                   🗑 Delete candidate
                 </button>
+                )}
                 <button onClick={() => openApp(null)} className="rounded p-1.5 text-slate-500 hover:bg-slate-100" aria-label="Close">
                   ✕
                 </button>
@@ -175,7 +198,23 @@ export function ApplicationDetail() {
                       </a>
                     </Info>
                   )}
-                  <Info label="Revised CV">{app.revisedCvUrl ? <CvLink app={app} /> : <span className="text-slate-400">Not revised yet</span>}</Info>
+                  {/* Highlighted green for the PM only; plain for everyone else. */}
+                  {app.revisedCvUrl && me.role === 'PM' ? (
+                    <div className="min-w-0 rounded-lg border-2 border-green-500 bg-green-50 px-2 py-1">
+                      <dt className="text-xs font-bold uppercase tracking-wide text-green-700">Revised CV</dt>
+                      <dd className="text-sm">
+                        <CvLink app={app} download className="font-bold text-green-700 underline hover:text-green-800" />
+                      </dd>
+                    </div>
+                  ) : app.revisedCvUrl ? (
+                    <Info label="Revised CV">
+                      <CvLink app={app} download />
+                    </Info>
+                  ) : (
+                    <Info label="Revised CV">
+                      <span className="text-slate-400">Not revised yet</span>
+                    </Info>
+                  )}
                   {app.originalCvUrl && (
                     <Info label="Original CV">
                       <CvLink app={app} original />
@@ -191,6 +230,11 @@ export function ApplicationDetail() {
                   {app.currentSalary && <Info label="Current salary">{app.currentSalary} LPA</Info>}
                   {app.expectedSalary && <Info label="Expected salary">{app.expectedSalary} LPA</Info>}
                   {app.noticePeriod && <Info label="Notice period">{app.noticePeriod}</Info>}
+                  {app.selectionReason && (
+                    <Info label="Reason for selection (PM)" wide>
+                      <span className="whitespace-pre-wrap">{app.selectionReason}</span>
+                    </Info>
+                  )}
                   <Info label="Client">
                     {app.clientName} <span className="text-slate-400">({app.clientId})</span>
                   </Info>
@@ -251,7 +295,14 @@ export function ApplicationDetail() {
                 })}
 
               {awaitingPeAnswer(app, me.id) && (
-                <Section title={`⚠ ${nameOf(app.assignedPM)} raised a doubt – please answer`} highlight>
+                <Section
+                  title={
+                    app.peUnanswered
+                      ? `⚠ ${nameOf(app.assignedPM)} could not reach the candidate – please call them`
+                      : `⚠ ${nameOf(app.assignedPM)} raised a doubt – please answer`
+                  }
+                  highlight
+                >
                   <PeAnswerPanel app={app} />
                 </Section>
               )}
@@ -259,26 +310,15 @@ export function ApplicationDetail() {
               {side === 'PM' && app.stage === 'pe_query' && (
                 <Section title="Waiting for the PE">
                   <p className="text-sm text-slate-600">
-                    You raised a doubt with {nameOf(app.assignedPE)}. The candidate comes back to you when they answer.
+                    {app.peUnanswered
+                      ? `You marked the candidate unanswered. ${nameOf(app.assignedPE)} will call them and tell you when they answer; then the candidate comes back to you.`
+                      : `You raised a doubt with ${nameOf(app.assignedPE)}. The candidate comes back to you when they answer.`}
                   </p>
                 </Section>
               )}
 
-              {/* A doubt from the Client Team: first thing the PM sees while it is open. */}
-              {(app.ctDoubt || app.lastCtDoubt || (side === 'ClientTeam' && !isClosed(app.stage) && !beforeClientTeam(app.stage))) && (
-                <Section
-                  title={
-                    side === 'PM' && app.ctDoubt && !isClosed(app.stage)
-                      ? `⚠ ${app.ctDoubt.byName} raised a doubt – please answer`
-                      : side === 'ClientTeam'
-                        ? `Doubt for ${nameOf(app.assignedPM)}`
-                        : 'Doubt from the Client Team'
-                  }
-                  highlight={side === 'PM' && !!app.ctDoubt && !isClosed(app.stage)}
-                >
-                  <CtDoubtPanel app={app} side={side} />
-                </Section>
-              )}
+              {/* An open doubt from the Client Team is the first thing the PM sees (it is their action). */}
+              {pmMustAnswerDoubt && doubtSection}
 
               {awaitingSend(app, me.id) ? (
                 <Section title="⚠ Your action is required" highlight>
@@ -296,6 +336,9 @@ export function ApplicationDetail() {
                   </Section>
                 )
               )}
+
+              {/* Otherwise the doubt panel ("Doubt for <PM>" for the Client Team) comes below the action panel. */}
+              {!pmMustAnswerDoubt && doubtSection}
 
               {!isClosed(app.stage) && (side === 'PM' || (me.role === 'PE' && app.assignedPE === me.id)) && (
                 <Section title="Candidate backout">

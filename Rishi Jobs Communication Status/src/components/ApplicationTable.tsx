@@ -2,7 +2,6 @@ import { useApp } from '../context/AppContext'
 import type { Application } from '../types'
 import { duration, timeAgo } from '../workflow/dates'
 import { awaitingSend, ctLabel, isMyTurn, pmLabel, toneFor } from '../workflow/workflow'
-import { CvLink } from './ApplicationDetail'
 import { StatusBadge, TONE_STYLES, ToneBadge, useNextActionText } from './StatusBadge'
 import { displayPhone } from './PhoneInput'
 import { Button, Empty, cx } from './ui'
@@ -31,30 +30,44 @@ function SendButton({ app, className }: { app: Application; className?: string }
 
 /** PM: what happened to a PE's candidate that no longer waits for the PM's decision. */
 function sentText(a: Application) {
-  if (a.stage === 'pe_query') return <span className="whitespace-nowrap text-xs font-medium text-amber-700">Doubt with PE…</span>
+  if (a.stage === 'pe_query') return <span className="whitespace-nowrap text-xs font-medium text-amber-700">{a.peUnanswered ? 'Unanswered – with PE…' : 'Doubt with PE…'}</span>
   if (a.stage === 'closed_backout') return <span className="whitespace-nowrap text-xs font-medium text-slate-500">Candidate backout</span>
   if (!a.assignedClientTeam) return <span className="whitespace-nowrap text-xs font-medium text-slate-500">Rejected by PM</span>
   return <span className="whitespace-nowrap text-xs font-medium text-emerald-700">Sent to Client Team ✓</span>
 }
 
-export function ApplicationTable({ apps, variant, empty = 'Nothing here.' }: { apps: Application[]; variant: TableVariant; empty?: string }) {
+/** A–Z by candidate name (then client and job). */
+export const byCandidate = (a: Application, b: Application) =>
+  a.candidateName.localeCompare(b.candidateName) || a.clientName.localeCompare(b.clientName) || a.jobTitle.localeCompare(b.jobTitle)
+/** A–Z by client, then job opening, then candidate name (the Client Team's tables start with the client). */
+export const byClientJobName = (a: Application, b: Application) =>
+  a.clientName.localeCompare(b.clientName) || a.jobTitle.localeCompare(b.jobTitle) || a.candidateName.localeCompare(b.candidateName)
+
+/** Every list of candidates is shown alphabetically: by the table's first column. */
+export function ApplicationTable({ apps: unsorted, variant, empty = 'Nothing here.' }: { apps: Application[]; variant: TableVariant; empty?: string }) {
   const { me, openApp, nameOf, names, now } = useApp()
   const nextText = useNextActionText()
-  if (!apps.length) return <Empty>{empty}</Empty>
+  if (!unsorted.length) return <Empty>{empty}</Empty>
+  const apps = [...unsorted].sort(variant === 'ct' ? byClientJobName : byCandidate)
 
   const admin = variant === 'admin'
+  const pe = variant === 'pe'
+  // The Client Team: client (with the job title) first, then the candidate, status, round, PM; no contact or CV.
+  const ct = variant === 'ct'
   // PMs always get an "Action" column at the end: the Send button while a PE's candidate waits, otherwise "Sent".
   const actionCol = variant === 'pm'
-  const heads = admin
-    ? ['Candidate', 'Client / Job', 'PE', 'PM', 'Client Team', 'PM status', 'Client Team status', 'Next action', 'In this status', 'Last updated']
+  const heads = ct
+    ? ['Client / Job', 'Candidate', 'Status', 'Round', 'PM', 'Next action', 'Last updated']
+    : admin
+    ? ['Candidate', 'Client / Job', 'PE', 'Client Team', 'PM status', 'Client Team status', 'Next action', 'In this status', 'Last updated']
     : [
         'Candidate',
         'Contact',
-        'CV',
-        'Client',
+        // No CV column (it opens from the candidate's details); the client shows its job title.
+        // A PE always works under the same PM: no PM column.
+        'Client / Job',
         ...(variant === 'pm' ? ['PE'] : []),
-        ...(variant === 'ct' ? ['PM'] : []),
-        ...(variant === 'pe' ? ['PM', 'Client Team'] : []),
+        ...(pe ? ['Client Team'] : []),
         'Round',
         'Status',
         'Next action',
@@ -86,6 +99,12 @@ export function ApplicationTable({ apps, variant, empty = 'Nothing here.' }: { a
                   onClick={() => openApp(a.id)}
                   className={cx('cursor-pointer border-l-4 align-top hover:bg-brand-50/50', TONE_STYLES[tone].row, unread && 'bg-red-50/30')}
                 >
+                  {ct && (
+                    <td className="px-3 py-2.5">
+                      <div className="font-medium text-slate-800">{a.clientName}</div>
+                      <div className="text-xs text-slate-500">{a.jobTitle}</div>
+                    </td>
+                  )}
                   <td className="px-3 py-2.5">
                     <div className="flex items-center gap-1.5">
                       <UnreadDot show={unread} />
@@ -93,14 +112,22 @@ export function ApplicationTable({ apps, variant, empty = 'Nothing here.' }: { a
                     </div>
                     <div className="text-xs text-slate-400">{a.candidateId}</div>
                   </td>
-                  {admin ? (
+                  {ct ? (
+                    <>
+                      <td className="max-w-60 px-3 py-2.5">
+                        <StatusBadge app={a} />
+                      </td>
+                      <td className="px-3 py-2.5 text-center">{a.currentInterviewRound}</td>
+                      <td className="px-3 py-2.5">{nameOf(a.assignedPM)}</td>
+                      <td className={cx('px-3 py-2.5', isMyTurn(a, me.id, now) && 'font-semibold text-red-700')}>{nextText(a)}</td>
+                    </>
+                  ) : admin ? (
                     <>
                       <td className="px-3 py-2.5">
                         <div>{a.clientName}</div>
                         <div className="text-xs text-slate-400">{a.jobTitle}</div>
                       </td>
                       <td className="px-3 py-2.5">{nameOf(a.assignedPE)}</td>
-                      <td className="px-3 py-2.5">{nameOf(a.assignedPM)}</td>
                       <td className="px-3 py-2.5">{nameOf(a.assignedClientTeam)}</td>
                       <td className="max-w-52 px-3 py-2.5">
                         <ToneBadge tone={toneFor(a, a.assignedPM)}>{pmLabel(a, undefined, names)}</ToneBadge>
@@ -115,15 +142,11 @@ export function ApplicationTable({ apps, variant, empty = 'Nothing here.' }: { a
                     <>
                       <td className="whitespace-nowrap px-3 py-2.5 text-slate-600">{displayPhone(a.candidateContactNumber)}</td>
                       <td className="px-3 py-2.5">
-                        <CvLink app={a} />
-                      </td>
-                      <td className="px-3 py-2.5">
                         <div>{a.clientName}</div>
-                        <div className="text-xs text-slate-400">{a.clientId}</div>
+                        <div className="text-xs text-slate-400">{a.jobTitle}</div>
                       </td>
                       {variant === 'pm' && <td className="px-3 py-2.5">{nameOf(a.assignedPE)}</td>}
-                      {(variant === 'ct' || variant === 'pe') && <td className="px-3 py-2.5">{nameOf(a.assignedPM)}</td>}
-                      {variant === 'pe' && <td className="px-3 py-2.5">{nameOf(a.assignedClientTeam)}</td>}
+                      {pe && <td className="px-3 py-2.5">{nameOf(a.assignedClientTeam)}</td>}
                       <td className="px-3 py-2.5 text-center">{a.currentInterviewRound}</td>
                       <td className="max-w-60 px-3 py-2.5">
                         <StatusBadge app={a} />
@@ -184,7 +207,7 @@ export function ApplicationTable({ apps, variant, empty = 'Nothing here.' }: { a
                   Next: <b className={cx(isMyTurn(a, me.id, now) && 'text-red-700')}>{nextText(a)}</b>
                 </span>
                 {a.currentInterviewRound > 1 && <span>Round {a.currentInterviewRound}</span>}
-                {!admin && <span>{displayPhone(a.candidateContactNumber)}</span>}
+                {!admin && !ct && <span>{displayPhone(a.candidateContactNumber)}</span>}
               </div>
               {variant === 'pm' && awaitingSend(a, me.id) && <SendButton app={a} className="mt-2 w-full" />}
             </li>

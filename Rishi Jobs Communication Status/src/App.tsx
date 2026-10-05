@@ -3,6 +3,7 @@ import { loadBackend, type Backend } from './backend'
 import { useIdleSignOut } from './backend/idleSignOut'
 import { ApplicationDetail } from './components/ApplicationDetail'
 import { Header } from './components/Header'
+import { DeadlineAlerts, StaleAlerts } from './components/DeadlineAlerts'
 import { DeleteCandidateDialog } from './components/DeleteDialogs'
 import { MessagesModal } from './components/MessagesPanel'
 import { NotificationBanner } from './components/NotificationBanner'
@@ -86,6 +87,8 @@ function Shell() {
       <Header />
       <main className="mx-auto max-w-7xl px-3 py-5 sm:px-6">
         <NotificationBanner />
+        <DeadlineAlerts />
+        <StaleAlerts />
         {loadError && (
           <div className="mb-4">
             <Alert>Could not load data: {loadError}</Alert>

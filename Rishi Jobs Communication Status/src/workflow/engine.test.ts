@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import type { Application, AvailabilityRound, Interview } from '../types'
 import { findMatches } from './dates'
 import { needsAutoDebrief, planAction, roundDocId, WorkflowError, type Action, type Actor, type WritePlan } from './engine'
-import { awaitingSend, ctLabel, firstReminderAt, isMyTurn, optionsFor, outcomeLabel, pmLabel, REMINDER_EVERY_MS, stepsDone, toneFor, viewerLabel } from './workflow'
+import { awaitingSend, ctLabel, ctStaleSince, firstReminderAt, isMyTurn, optionsFor, outcomeLabel, peUnansweredOverdueAt, pmLabel, REMINDER_EVERY_MS, stepsDone, toneFor, viewerLabel } from './workflow'
 
 const PM: Actor = { id: 'pm1', name: 'Shubham', role: 'PM' }
 const CT: Actor = { id: 'ct1', name: 'Dipanshi', role: 'ClientTeam' }
@@ -60,6 +60,7 @@ class Harness {
     return this.run(PM, {
       kind: 'send_to_ct',
       message: 'Prefers afternoons',
+      reason: 'Matches the job',
       data: {
         candidateId: this.app.candidateId,
         candidateName: 'Asha',
@@ -76,6 +77,22 @@ class Harness {
     })
   }
 }
+
+describe('Client Team status unchanged for 6 days', () => {
+  it('flags the Super Admin only once the CV is with the client, counting from the last Client Team status change', () => {
+    const h = new Harness()
+    h.submit()
+    expect(ctStaleSince(h.app, h.now + 10 * DAY)).toBeNull() // not with the client yet
+    h.run(CT, { kind: 'status', code: 'cv_submitted_to_client' })
+    const since = h.app.ctStatusSince!
+    expect(since).toBe(h.now)
+    expect(ctStaleSince(h.app, since + 5 * DAY)).toBeNull()
+    expect(ctStaleSince(h.app, since + 6 * DAY)).toBe(since)
+    // A note does not move the Client Team status.
+    h.run(PM, { kind: 'note', message: 'Any update?' })
+    expect(h.app.ctStatusSince).toBe(since)
+  })
+})
 
 describe('Client Team raises a doubt with the PM', () => {
   const names = (id: string) => ({ pm1: 'Shubham', ct1: 'Dipanshi', pe1: 'Bhavya' })[id]
@@ -485,6 +502,7 @@ describe('PE adds a candidate → PM revises the CV and sends it to the Client T
     h.run(actor, {
       kind: 'send_to_ct',
       message: 'Please share with client',
+      reason: 'Strong GST experience',
       data: {
         candidateId: h.app.candidateId,
         candidateName: 'Ravi Kumar',
@@ -527,6 +545,91 @@ describe('PE adds a candidate → PM revises the CV and sends it to the Client T
     expect(h.app.unreadFor).toEqual([])
     send(h)
     expect(() => h.run(PM, { kind: 'cv_checked', fileName: 'x.pdf' })).toThrow(/already been sent/)
+  })
+
+  it('logs the PM’s reason for selecting the candidate, and requires it', () => {
+    const h = new Harness()
+    peSubmit(h)
+    expect(() =>
+      h.run(PM, { kind: 'send_to_ct', message: 'Mon 10am', reason: ' ', data: { ...h.app, assignedClientTeam: 'ct1', revisedCvUrl: 'https://drive/r.pdf' } as never }),
+    ).toThrow(/reason for selection/i)
+    send(h)
+    expect(h.app.selectionReason).toBe('Strong GST experience')
+    expect(h.timeline.find((e) => e.statusCode === 'pm_select')).toMatchObject({ statusLabel: 'Selected by PM Shubham', message: 'Strong GST experience', actor: 'pm1' })
+  })
+
+  it('sends an unanswered candidate to the PE to reach, and back to the PM when the PE says they answered', () => {
+    const h = new Harness()
+    peSubmit(h)
+    h.app.unreadFor = []
+    expect(() => h.run(PM, { kind: 'pm_unanswered', message: '' })).toThrow()
+    expect(() => h.run(PE, { kind: 'pm_unanswered', message: 'x' })).toThrow()
+    h.run(PM, { kind: 'pm_unanswered', message: 'Called twice, no answer' })
+    expect(h.timeline.at(-1)).toMatchObject({ statusCode: 'pm_unanswered', statusLabel: 'Marked unanswered by PM Shubham', message: 'Called twice, no answer' })
+    // The PE's turn (red for the PE); the PM waits.
+    expect(h.app).toMatchObject({ stage: 'pe_query', peUnanswered: true, peAnswered: false, nextActionBy: ['pe1'] })
+    expect(h.app.unreadFor).toContain('pe1')
+    expect(viewerLabel(h.app, 'pe1', 'PE', undefined, (id) => ({ pm1: 'Shubham' })[id])).toBe(
+      'Pending – Shubham could not reach the candidate: call the candidate and let Shubham know when they answer',
+    )
+    expect(pmLabel(h.app)).toMatch(/^Unanswered – waiting for/)
+    // The PE reached the candidate: back to the PM's turn, logged.
+    expect(() => h.run(PE, { kind: 'pe_answer', message: ' ' })).toThrow(/message to the PM/)
+    h.run(PE, { kind: 'pe_answer', message: 'Answered at 4 PM, please call' })
+    expect(h.timeline.at(-1)).toMatchObject({ statusCode: 'pe_reached', actor: 'pe1', message: 'Answered at 4 PM, please call' })
+    expect(h.app).toMatchObject({ stage: 'pe_submitted', peAnswered: true, nextActionBy: ['pm1'] })
+    expect(h.app.unreadFor).toContain('pm1')
+    expect(pmLabel(h.app)).toMatch(/says the candidate answered/)
+    // The PM decides again — even unanswered once more, or a doubt.
+    h.run(PM, { kind: 'pm_unanswered', message: 'Missed the call again' })
+    expect(h.app.stage).toBe('pe_query')
+    h.run(PE, { kind: 'pe_answer', message: 'Try now' })
+    h.run(PM, { kind: 'pm_query', message: 'Notice period?' })
+    expect(h.app.peUnanswered).toBe(false)
+    expect(viewerLabel(h.app, 'pe1', 'PE')).toMatch(/raised a doubt/)
+  })
+
+  it('flags the admins when the PE has not replied to an unanswered candidate for 48 hours', () => {
+    const h = new Harness()
+    peSubmit(h)
+    h.run(PM, { kind: 'pm_query', message: 'Notice period?' })
+    expect(peUnansweredOverdueAt(h.app, h.now + 3 * DAY)).toBeNull() // a doubt, not unanswered
+    h.run(PE, { kind: 'pe_answer', message: '30 days' })
+    h.run(PM, { kind: 'pm_unanswered', message: 'No answer' })
+    const since = h.app.stageSince
+    expect(peUnansweredOverdueAt(h.app, since + 47 * 3_600_000)).toBeNull()
+    expect(peUnansweredOverdueAt(h.app, since + 49 * 3_600_000)).toBe(since + 48 * 3_600_000)
+    h.run(PE, { kind: 'pe_answer', message: 'Reached now' })
+    expect(peUnansweredOverdueAt(h.app, since + 3 * DAY)).toBeNull()
+  })
+
+  it('logs when the PM generated the revised CV, alerting nobody', () => {
+    const h = new Harness()
+    peSubmit(h)
+    h.app.unreadFor = []
+    h.now += 60_000
+    expect(() => h.run(PE, { kind: 'cv_generated', fileName: 'x.pdf' })).toThrow()
+    h.run(PM, { kind: 'cv_generated', fileName: 'Ravi_Kumar_RishiJobs.pdf' })
+    expect(h.timeline.at(-1)).toMatchObject({ type: 'cv_upload', actor: 'pm1', statusLabel: 'Revised CV generated by PM Shubham (Ravi_Kumar_RishiJobs.pdf)', timestamp: h.now })
+    expect(h.app.stage).toBe('pe_submitted')
+    expect(h.app.unreadFor).toEqual([])
+    send(h)
+    expect(() => h.run(PM, { kind: 'cv_generated', fileName: 'x.pdf' })).toThrow(/already been sent/)
+  })
+
+  it('logs when the Client Team downloads the revised CV, alerting nobody', () => {
+    const h = new Harness()
+    peSubmit(h)
+    expect(() => h.run(CT, { kind: 'cv_downloaded' })).toThrow()
+    send(h)
+    h.app.unreadFor = []
+    const stage = h.app.stage
+    h.now += 60_000
+    expect(() => h.run(PM, { kind: 'cv_downloaded' })).toThrow()
+    h.run(CT, { kind: 'cv_downloaded' })
+    expect(h.timeline.at(-1)).toMatchObject({ type: 'cv_upload', actor: 'ct1', statusLabel: 'Revised CV downloaded by Dipanshi', timestamp: h.now })
+    expect(h.app.stage).toBe(stage)
+    expect(h.app.unreadFor).toEqual([])
   })
 
   it('lets the client’s Client Team member follow it before the PM sends it, without alerting them', () => {

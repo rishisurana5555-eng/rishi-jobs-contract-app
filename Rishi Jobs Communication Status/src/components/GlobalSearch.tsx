@@ -167,7 +167,7 @@ function SearchResult({ picked, onPick, onClose }: { picked: Hit; onPick: (h: Hi
           {related.length ? (
             <ul className="divide-y divide-slate-100 text-sm">
               {related
-                .sort((a, b) => b.lastUpdatedAt - a.lastUpdatedAt)
+                .sort((a, b) => a.candidateName.localeCompare(b.candidateName) || a.clientName.localeCompare(b.clientName))
                 .map((a) => (
                   <li key={a.id}>
                     <button onClick={() => openSubmission(a)} className="w-full py-2 text-left hover:bg-slate-50">

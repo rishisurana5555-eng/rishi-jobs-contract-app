@@ -5,19 +5,6 @@
 import type { Application, CtStatus, PmStatus, Role, Side, Stage } from '../types'
 import { fmtDateTime } from './dates'
 
-export const STAGES: Stage[] = [
-  'pe_submitted',
-  'pe_query',
-  'new_submission',
-  'cv_with_client',
-  'rescheduling',
-  'interview_scheduled',
-  'debrief_pending',
-  'closed_placed',
-  'closed_rejected',
-  'closed_backout',
-]
-
 export const STAGE_NAMES: Record<Stage, string> = {
   pe_submitted: 'New from PE – with PM',
   pe_query: 'Doubt – with PE',
@@ -114,11 +101,20 @@ export const CT_STATUS_LABELS: Record<CtStatus, string> = {
 
 type LabelInput = Pick<
   Application,
-  'currentInterviewRound' | 'scheduledInterviewAt' | 'clientWaitUntil' | 'candidateWaitUntil' | 'assignedPE' | 'assignedPM' | 'assignedClientTeam' | 'peAnswered'
+  'currentInterviewRound' | 'scheduledInterviewAt' | 'clientWaitUntil' | 'candidateWaitUntil' | 'assignedPE' | 'assignedPM' | 'assignedClientTeam' | 'peAnswered' | 'peUnanswered'
 >
 
 /** The PM's label once the PE has answered their doubt. */
 const PE_ANSWERED_STATUS = '{pe} answered your doubt'
+/** The PM marked the candidate unanswered: the PE is reaching them; then the PE says they answered. */
+const PM_UNANSWERED_STATUS = 'Unanswered – waiting for {pe} to reach the candidate'
+const PE_REACHED_STATUS = 'Pending – {pe} says the candidate answered: connect with them, then send, reject, raise a doubt or mark unanswered'
+
+function pmTemplate(app: LabelInput & { pmStatus: PmStatus }) {
+  if (app.pmStatus === 'query_to_pe' && app.peUnanswered) return PM_UNANSWERED_STATUS
+  if (app.pmStatus === 'pending_pe_submission' && app.peAnswered) return app.peUnanswered ? PE_REACHED_STATUS : PE_ANSWERED_STATUS
+  return PM_STATUS_LABELS[app.pmStatus]
+}
 
 /** A person's name by user id (undefined if unknown). Status labels show names instead of "PE", "PM" or "Client Team". */
 export type Names = (id: string) => string | undefined
@@ -126,10 +122,11 @@ export type Names = (id: string) => string | undefined
 /** {pe}, {pm} and {ct} in a label → that person's name, or the role when unknown / not set yet. */
 export function withNames(label: string, app: Pick<Application, 'assignedPE' | 'assignedPM' | 'assignedClientTeam'>, names?: Names) {
   const who = (id: string | null | undefined, role: string) => (id && names?.(id)) || role
+  // Every occurrence: a label may name the same person twice.
   return label
-    .replace('{pe}', who(app.assignedPE, 'PE'))
-    .replace('{pm}', who(app.assignedPM, 'PM'))
-    .replace('{ct}', who(app.assignedClientTeam, 'Client Team'))
+    .replace(/\{pe\}/g, who(app.assignedPE, 'PE'))
+    .replace(/\{pm\}/g, who(app.assignedPM, 'PM'))
+    .replace(/\{ct\}/g, who(app.assignedClientTeam, 'Client Team'))
 }
 
 /** Who a side waits on: the PM waits on the candidate, the Client Team on the client. */
@@ -154,7 +151,7 @@ function fill(template: string, app: LabelInput, now: number, side: Side, names?
 }
 
 export const pmLabel = (app: LabelInput & { pmStatus: PmStatus }, now = Date.now(), names?: Names) =>
-  fill(app.pmStatus === 'pending_pe_submission' && app.peAnswered ? PE_ANSWERED_STATUS : PM_STATUS_LABELS[app.pmStatus], app, now, 'PM', names)
+  fill(pmTemplate(app), app, now, 'PM', names)
 export const ctLabel = (app: LabelInput & { clientTeamStatus: CtStatus }, now = Date.now(), names?: Names) =>
   fill(CT_STATUS_LABELS[app.clientTeamStatus], app, now, 'ClientTeam', names)
 export const sideLabel = (app: Application, side: Side, now = Date.now(), names?: Names) =>
@@ -198,9 +195,11 @@ export const SUBMIT_LABEL = 'Submitted CV to Client Team'
 export const PE_SUBMIT_LABEL = 'Submitted new candidate to PM'
 const PE_SUBMIT_STATUS = 'Submitted new candidate to {pm}'
 const PE_QUERY_STATUS = 'Pending – {pm} raised a doubt: please answer'
+const PE_UNANSWERED_STATUS = 'Pending – {pm} could not reach the candidate: call the candidate and let {pm} know when they answer'
 /** What the Client Team member sees while their client's candidate is still with the PE and PM. */
 const CT_FOLLOW_STATUS = { pe_submitted: 'New candidate from {pe} – with {pm}, not sent to you yet', pe_query: '{pm} raised a doubt with {pe} – not sent to you yet' } as const
 export const PE_ANSWER_LABEL = 'PE answered the doubt'
+export const PE_REACHED_LABEL = 'PE: the candidate answered – PM to connect with them'
 export const peAddedLabel = (peName: string) => `New candidate added by PE ${peName}`
 /** The PM's button on a candidate added by a PE. */
 export const SEND_TO_CT_LABEL = 'Send this candidate to Client Team'
@@ -209,6 +208,25 @@ export const SEND_TO_CT_LABEL = 'Send this candidate to Client Team'
 export const awaitingSend = (app: Application, userId: string) => app.stage === 'pe_submitted' && app.assignedPM === userId
 
 /** The PM asked this PE a question about their candidate and is waiting for the answer. */
+/** The PM marked a PE's candidate unanswered and the PE has not replied for this long: the admins are alerted. */
+export const PE_UNANSWERED_ALERT_MS = 48 * 3_600_000
+/** When the PE's reply to an "unanswered" became overdue for the admins (null: not overdue). */
+export function peUnansweredOverdueAt(app: Application, now: number): number | null {
+  if (app.stage !== 'pe_query' || !app.peUnanswered) return null
+  const at = app.stageSince + PE_UNANSWERED_ALERT_MS
+  return now >= at ? at : null
+}
+
+/** The CV is with the client and the Client Team status has not changed for this long: the Super Admin is alerted. */
+export const CT_STALE_ALERT_MS = 6 * 86_400_000
+const CT_STALE_STAGES: readonly Stage[] = ['cv_with_client', 'rescheduling', 'debrief_pending']
+/** Since when the Client Team status has stood still past the limit (null: not stale, or the client asked to wait). */
+export function ctStaleSince(app: Application, now: number): number | null {
+  if (!CT_STALE_STAGES.includes(app.stage) || (app.clientWaitUntil ?? 0) > now) return null
+  const since = app.ctStatusSince ?? app.stageSince
+  return now - since >= CT_STALE_ALERT_MS ? since : null
+}
+
 export const awaitingPeAnswer = (app: Application, userId: string) => app.stage === 'pe_query' && app.assignedPE === userId
 
 /** Still with the PE and PM — not sent to the Client Team yet. */
@@ -388,10 +406,11 @@ export function viewerLabel(app: Application, viewerId: string, role: Role, now 
   if (side) return sideLabel(app, side, now, names)
   if (role === 'PE') {
     if (app.stage === 'pe_submitted') return withNames(PE_SUBMIT_STATUS, app, names)
-    if (app.stage === 'pe_query') return withNames(PE_QUERY_STATUS, app, names)
+    if (app.stage === 'pe_query') return withNames(app.peUnanswered ? PE_UNANSWERED_STATUS : PE_QUERY_STATUS, app, names)
     return pmLabel(app, now, names)
   }
-  if (role === 'ClientTeam' && (app.stage === 'pe_submitted' || app.stage === 'pe_query')) return withNames(CT_FOLLOW_STATUS[app.stage], app, names)
+  if (role === 'ClientTeam' && (app.stage === 'pe_submitted' || app.stage === 'pe_query'))
+    return withNames(app.stage === 'pe_query' && app.peUnanswered ? '{pm} could not reach the candidate – with {pe}, not sent to you yet' : CT_FOLLOW_STATUS[app.stage], app, names)
   return beforeClientTeam(app.stage) ? pmLabel(app, now, names) : ctLabel(app, now, names)
 }
 

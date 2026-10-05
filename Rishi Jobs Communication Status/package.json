@@ -16,7 +16,6 @@
   },
   "dependencies": {
     "firebase": "^12.19.0",
-    "pdfjs-dist": "^6.3.289",
     "react": "^19.3.0",
     "react-dom": "^19.3.0"
   },

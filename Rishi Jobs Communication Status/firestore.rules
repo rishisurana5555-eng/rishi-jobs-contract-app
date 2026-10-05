@@ -28,9 +28,19 @@ service cloud.firestore {
     function isClientTeamMember() {
       return isMember() && get(profilePath()).data.role == 'ClientTeam';
     }
+    // Adding and editing clients and job openings is the Client Team's work; of the admins, the Super Admin
+    // may, and an Admin only once the Super Admin has allowed it (users/{uid}.canEditCatalog, which only the
+    // Super Admin can set on an Admin account — see /users below).
+    function isCatalogAdmin() {
+      return isSuperAdmin() || (isAdmin() && get(profilePath()).data.get('canEditCatalog', false) == true);
+    }
 
     // Admins read every submission's history at once for the Reports tab (a collection-group query).
     match /{path=**}/timeline/{entryId} {
+      allow read: if isAdmin();
+    }
+    // Admins read every client's and job opening's log at once (also of deleted ones).
+    match /{path=**}/log/{entryId} {
       allow read: if isAdmin();
     }
 
@@ -50,8 +60,17 @@ service cloud.firestore {
     match /clients/{clientId} {
       allow get: if isAdmin() || (isClientTeamMember() && (resource == null || resource.data.assignedClientTeam == request.auth.uid));
       allow list: if isAdmin() || (isClientTeamMember() && resource.data.assignedClientTeam == request.auth.uid);
-      allow create: if isAdmin() || isClientTeamMember();
-      allow update, delete: if isAdmin() || (isClientTeamMember() && resource.data.assignedClientTeam == request.auth.uid);
+      allow create: if isCatalogAdmin() || isClientTeamMember();
+      allow update: if isCatalogAdmin() || (isClientTeamMember() && resource.data.assignedClientTeam == request.auth.uid);
+      // Deleting a client (with its job openings and submissions): the Super Admin only.
+      allow delete: if isSuperAdmin();
+
+      // The client's log: added, edited (with the reason), deleted. Written as yourself; never changed.
+      match /log/{entryId} {
+        allow read: if isAdmin() || (isClientTeamMember() && get(/databases/$(database)/documents/clients/$(clientId)).data.assignedClientTeam == request.auth.uid);
+        allow create: if isMember() && request.resource.data.by == request.auth.uid && (isCatalogAdmin() || isClientTeamMember());
+        allow update, delete: if false;
+      }
     }
 
     // Job openings are handed down: the Client Team adds one, an Admin assigns it to a PM, and that PM
@@ -67,7 +86,7 @@ service cloud.firestore {
         return get(/databases/$(database)/documents/users/$(uid)).data.role;
       }
       function handDownKeys() {
-        return ['assignedPM', 'pmAssignedAt', 'pmAssignedBy', 'pmAssignedByName',
+        return ['assignedPM', 'pmAssignedAt', 'pmAssignedBy', 'pmAssignedByName', 'delegation',
                 'assignedPE', 'peAssignedAt', 'peAssignedBy', 'peAssignedByName'];
       }
       function peKeys() {
@@ -86,12 +105,16 @@ service cloud.firestore {
       allow get: if isAdmin() || (isMember() && (resource == null || onJob(resource.data)));
       allow list: if isAdmin() || (isMember() && onJob(resource.data));
       // A new job opening starts with the admins: no PM or PE yet.
-      allow create: if isAdmin() || (isClientTeamMember()
+      allow create: if isCatalogAdmin() || (isClientTeamMember()
         && request.resource.data.assignedClientTeam == clientTeamOfClient(request.resource.data.clientId)
         && request.resource.data.assignedPM == null
         && request.resource.data.assignedPE == null
         && request.resource.data.createdBy == request.auth.uid);
-      allow update: if isAdmin()
+      allow update: if isCatalogAdmin()
+        // Every admin assigns the PM (the hand-down) and adds notes; editing the job opening itself needs isCatalogAdmin.
+        || (isAdmin()
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(handDownKeys().concat(['notes']))
+            && notesAppendOnly())
         // The Client Team edits the title, details and status (and copies a client change), and adds notes; never the hand-down.
         || (isClientTeamMember() && resource.data.assignedClientTeam == request.auth.uid
             && !request.resource.data.diff(resource.data).affectedKeys().hasAny(handDownKeys())
@@ -106,13 +129,24 @@ service cloud.firestore {
         || (isMember() && myRole() == 'PE' && resource.data.assignedPE == request.auth.uid
             && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['notes'])
             && notesAppendOnly());
-      allow delete: if isAdmin() || (isClientTeamMember() && resource.data.assignedClientTeam == request.auth.uid);
+      // Only the admins delete job openings (the Client Team never does).
+      allow delete: if isAdmin();
+
+      // The job opening's log: added, edited (with the reason), assigned, notes. Everyone on the job
+      // opening reads it and writes their own entries (getAfter: the job may be saved in the same write).
+      match /log/{entryId} {
+        allow read: if isAdmin() || (isMember() && onJob(get(/databases/$(database)/documents/jobOpenings/$(jobId)).data));
+        allow create: if isMember() && request.resource.data.by == request.auth.uid
+          && (isAdmin() || onJob(getAfter(/databases/$(database)/documents/jobOpenings/$(jobId)).data));
+        allow update, delete: if false;
+      }
     }
 
     // The candidate themself, apart from any client (see CandidateProfile in src/types).
     // people = the PE who added them and that PE's PM. Everyone who works on a candidate can delete them.
     match /candidates/{candidateId} {
-      allow read: if isMember() && (isAdmin() || isClientTeamMember() || request.auth.uid in resource.data.people);
+      // The Client Team reads no profiles: they see only the submissions sent to them.
+      allow read: if isMember() && (isAdmin() || request.auth.uid in resource.data.people);
       // Written together with the PE's submission (a new candidate, or an existing one sent to another client).
       allow create: if isMember() && myRole() == 'PE'
         && request.resource.data.pe == request.auth.uid
@@ -120,7 +154,8 @@ service cloud.firestore {
         && request.resource.data.createdBy == request.auth.uid;
       allow update: if isMember() && (isAdmin() || request.auth.uid in resource.data.people)
         && request.resource.data.diff(resource.data).unchangedKeys().hasAll(['pe', 'createdAt', 'createdBy']);
-      allow delete: if isMember() && (isAdmin() || isClientTeamMember() || request.auth.uid in resource.data.people);
+      // Deleting a candidate (everywhere, with all their submissions): the Super Admin only.
+      allow delete: if isSuperAdmin();
     }
 
     // Which candidate each phone number belongs to (no two candidates share a number): phoneIndex/{digits
@@ -309,7 +344,8 @@ service cloud.firestore {
 
       // The Client Team may also read other submissions: deleting a client (or a candidate) has to find
       // all of them, including ones not yet sent on. Their dashboard still only lists their own.
-      allow read: if isAdmin() || isClientTeamMember() || isPM(resource.data) || isCT(resource.data) || isPE(resource.data);
+      // A Client Team member reads only the submissions a PM has sent to them (isCT), never others'.
+      allow read: if isAdmin() || isPM(resource.data) || isCT(resource.data) || isPE(resource.data);
 
       function jobOf(jobId) {
         return get(/databases/$(database)/documents/jobOpenings/$(jobId)).data;
@@ -339,7 +375,8 @@ service cloud.firestore {
         ));
 
       // Deleting a candidate or a client removes the submissions (children first; see deleteApplication).
-      allow delete: if isAdmin() || isClientTeamMember() || isPM(resource.data) || isPE(resource.data);
+      // Only with a candidate or a client being deleted: the Super Admin only.
+      allow delete: if isSuperAdmin();
 
       // ---------- subcollections ----------
       function parent() { return get(/databases/$(database)/documents/applications/$(appId)).data; }
@@ -347,12 +384,11 @@ service cloud.firestore {
       function parentAfter() { return getAfter(/databases/$(database)/documents/applications/$(appId)).data; }
       function canReadChildren() {
         let p = parent();
-        return isAdmin() || isClientTeamMember() || isPM(p) || isCT(p) || isPE(p);
+        return isAdmin() || isPM(p) || isCT(p) || isPE(p);
       }
       // Same people as for deleting the submission itself (the children go first, while it still exists).
       function canDeleteChildren() {
-        let p = parent();
-        return isAdmin() || isClientTeamMember() || isPM(p) || isPE(p);
+        return isSuperAdmin();
       }
       // The PE writes the first history entries and dates only while creating the record.
       function canWriteChildren() {

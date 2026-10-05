@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { ApplicationTable } from '../components/ApplicationTable'
-import { byRecent, FilterBar, StatCard, useSearch } from '../components/DashboardWidgets'
+import { FilterBar, useCountBoxes, useSearch } from '../components/DashboardWidgets'
 import { CandidatesList } from '../components/CandidatesList'
 import { JobOpenings } from '../components/JobOpenings'
 import { Button, Card, Empty, Select, Tabs, cx } from '../components/ui'
@@ -25,7 +25,6 @@ export function AdminDashboard() {
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <h1 className="text-xl font-bold text-slate-900">{ROLE_LABELS[me.role]} overview</h1>
-          <p className="text-sm text-slate-500">Filter or search to see the submissions you want, across all PEs, PMs and Client Team members.</p>
         </div>
         <Tabs
           value={tab}
@@ -39,19 +38,18 @@ export function AdminDashboard() {
           ]}
         />
       </div>
-      {tab === 'overview' ? <Overview /> : tab === 'jobs' ? <JobOpenings /> : tab === 'candidates' ? <CandidatesList searchFirst /> : tab === 'reports' ? <ReportsPage /> : <SetupPage />}
+      {tab === 'overview' ? <Overview onOpenJobs={() => setTab('jobs')} /> : tab === 'jobs' ? <JobOpenings /> : tab === 'candidates' ? <CandidatesList searchFirst /> : tab === 'reports' ? <ReportsPage /> : <SetupPage />}
     </div>
   )
 }
 
 /**
- * Nothing is listed until the admin asks for it: the counts at the top, then a status, person, client
- * or search picks the submissions to show. The team rollup opens on request.
+ * The count boxes at the top (each opens its list), then a status, person, client or search picks the
+ * submissions to show below. The team rollup opens on request. Lists are A–Z.
  */
-function Overview() {
-  const { apps, users, clients, now, nameOf } = useApp()
+function Overview({ onOpenJobs }: { onOpenJobs: () => void }) {
+  const { apps, users, clients, now, nameOf, jobsToAssign } = useApp()
   const [filter, setFilter] = useState<Filter | ''>('')
-  const [sort, setSort] = useState<'stuck' | 'recent'>('stuck')
   const [person, setPerson] = useState('')
   const [clientId, setClientId] = useState('')
   const [showTeam, setShowTeam] = useState(false)
@@ -74,9 +72,7 @@ function Overview() {
   const onPerson = (a: Application, id: string) => a.assignedPM === id || a.assignedClientTeam === id || a.assignedPE === id
   const chosen = !!(filter || person || clientId || search.trim())
   const shown = chosen
-    ? apps
-        .filter((a) => (!filter || testOf(filter)(a)) && match(a) && (!person || onPerson(a, person)) && (!clientId || a.clientId === clientId))
-        .sort(sort === 'recent' ? byRecent : (a, b) => a.stageSince - b.stageSince)
+    ? apps.filter((a) => (!filter || testOf(filter)(a)) && match(a) && (!person || onPerson(a, person)) && (!clientId || a.clientId === clientId))
     : []
   const clear = () => {
     setFilter('')
@@ -89,20 +85,25 @@ function Overview() {
     .filter((u) => u.role === 'PE' || u.role === 'PM' || u.role === 'ClientTeam')
     .sort((a, b) => a.role.localeCompare(b.role) || a.name.localeCompare(b.name))
   const roleShort = (r: string) => (r === 'ClientTeam' ? 'Client Team' : r)
-  const card = (f: Filter, label: string, tone?: 'red' | 'blue' | 'green') => (
-    <StatCard label={label} value={count(f)} tone={tone} onClick={() => setFilter(filter === f ? '' : f)} active={filter === f} />
+  const box = (f: Filter, label: string, tone: 'red' | 'blue' | 'green' | 'slate') => ({ key: f, label, count: count(f), tone, apps: apps.filter(testOf(f)), empty: 'No submissions here.' })
+  // An admin's own action: the new job openings waiting for them to assign a PM (opens Job openings).
+  const { boxes, page } = useCountBoxes(
+    [
+      { key: 'action', label: 'My action required – job openings to assign', count: jobsToAssign.length, tone: 'red', onOpen: onOpenJobs },
+      box('open', 'Open submissions', 'slate'),
+      box('stuck', 'Stuck > 48h', 'red'),
+      box('interview', 'Interviews scheduled', 'blue'),
+      box('placed', 'Placed', 'green'),
+      box('rejected', 'Rejected', 'slate'),
+      box('backout', 'Candidate backout', 'slate'),
+    ],
+    'admin',
   )
+  if (page) return page
 
   return (
     <>
-      <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
-        {card('open', 'Open submissions')}
-        {card('stuck', 'Stuck > 48h', 'red')}
-        {card('interview', 'Interviews scheduled', 'blue')}
-        {card('placed', 'Placed', 'green')}
-        {card('rejected', 'Rejected')}
-        {card('backout', 'Candidate backout')}
-      </div>
+      {boxes}
 
       <section className="space-y-3">
         <FilterBar search={search} onSearch={setSearch}>
@@ -133,21 +134,15 @@ function Overview() {
               ))}
           </Select>
           {chosen && (
-            <>
-              <Select value={sort} onChange={(e) => setSort(e.target.value as 'stuck' | 'recent')} className="w-auto py-1.5" aria-label="Sort">
-                <option value="stuck">Sort: stuck longest first</option>
-                <option value="recent">Sort: recently updated</option>
-              </Select>
-              <Button variant="ghost" className="py-1 text-xs" onClick={clear}>
-                Clear
-              </Button>
-            </>
+            <Button variant="ghost" className="py-1 text-xs" onClick={clear}>
+              Clear
+            </Button>
           )}
         </FilterBar>
         {chosen ? (
           <ApplicationTable apps={shown} variant="admin" empty="No submissions match." />
         ) : (
-          <Empty>Choose a status, person or client, click a count above, or search — the matching submissions are shown here.</Empty>
+          <Empty>Choose a status, person or client, or search — the matching submissions are shown here.</Empty>
         )}
       </section>
 

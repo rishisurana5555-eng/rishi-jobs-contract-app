@@ -27,13 +27,38 @@ export interface AppUser {
   /** PE → PM link */
   reportsTo?: string | null
   active: boolean
+  /**
+   * Admins only: the Super Admin has allowed them to add and edit clients and job openings (the Client
+   * Team's work). Missing = not allowed. Also enforced in firestore.rules.
+   */
+  canEditCatalog?: boolean
 }
+
+/** Adds and edits clients and job openings: the Client Team, the Super Admin, and Admins the Super Admin allowed. */
+export const canEditCatalog = (u: Pick<AppUser, 'role' | 'canEditCatalog'>) =>
+  u.role === 'ClientTeam' || u.role === 'SuperAdmin' || (u.role === 'Admin' && u.canEditCatalog === true)
 
 /** Who added a client / job opening and when (drives the one-time "new client / job" alert). Missing on older records. */
 export interface CreatedStamp {
   createdAt?: number
   createdBy?: string
   createdByName?: string
+}
+
+/**
+ * The last edit of a client / job opening (the reason is compulsory). It drives the one-time "edited"
+ * alert to the admins and the PM / PE on the job openings. A client edit is also stamped on its job
+ * openings (what: 'client'), so their PM and PE hear of it. Missing until the first edit.
+ */
+export interface CatalogEdit {
+  at: number
+  by: string
+  byName: string
+  role: Role
+  reason: string
+  /** what was changed, e.g. "Title: Accountant → Senior Accountant" */
+  summary: string
+  what: 'client' | 'job'
 }
 
 export interface Client extends CreatedStamp {
@@ -47,9 +72,40 @@ export interface Client extends CreatedStamp {
    * Missing on older records.
    */
   jobsAtCreation?: number
+  lastEdit?: CatalogEdit
 }
 
 export type JobStatus = 'open' | 'closed' | 'on-hold'
+
+/** Chosen when the job opening is added (and editable): how urgent it is. Missing on older records = active. */
+export type JobPriority = 'active' | 'second_priority'
+export const JOB_PRIORITY_LABEL: Record<JobPriority, string> = { active: 'Active', second_priority: 'Second priority' }
+
+/** Chosen by the Admin when assigning the PM. */
+export type Delegation = 1 | 2 | 3
+export const DELEGATION_LABEL: Record<Delegation, string> = { 1: '1st delegation', 2: '2nd delegation', 3: '3rd delegation' }
+
+/**
+ * One line of a client's / job opening's log: clients/{id}/log and jobOpenings/{id}/log. Written with
+ * every change (added, edited with its reason, assigned, status, notes, deleted). Never changed.
+ */
+export interface CatalogLogEntry {
+  id: string
+  kind: 'client' | 'job'
+  action: 'created' | 'edited' | 'assigned_pm' | 'assigned_pe' | 'note' | 'deleted'
+  clientId: string
+  clientName: string
+  jobId?: string
+  jobTitle?: string
+  /** what happened / what changed */
+  summary: string
+  /** the reason given (compulsory for edits) */
+  reason: string
+  by: string
+  byName: string
+  role: Role
+  at: number
+}
 
 /**
  * Firestore candidates/{id}: the candidate themself, apart from any client. Each submission to a
@@ -120,6 +176,19 @@ export interface JobOpening extends CreatedStamp {
   /** what the job is: requirements, experience, location, salary… */
   details: string
   status: JobStatus
+  /** missing on older records = active */
+  priority?: JobPriority
+  /** When the priority last changed (Active ↔ Second priority): the job's age counts from then. Missing = never. */
+  priorityChangedAt?: number | null
+  /** set by the Admin with the PM (missing on older records / before a PM is assigned) */
+  delegation?: Delegation | null
+  /**
+   * Set by the Client Team (optional, editable): candidates must be submitted before this time (epoch ms).
+   * It goes down with the job opening to the PM and PE; once it passes without a submission, they get the
+   * pending work alert and the admins are told. Missing / null = no deadline.
+   */
+  submitBy?: number | null
+  lastEdit?: CatalogEdit
   /** the client's Client Team member (copied from the client) */
   assignedClientTeam: string
   /** null until an Admin assigns it */
@@ -222,8 +291,16 @@ export interface Application {
    * to the Client Team). Doubts and answers between the PM and PE never replace it. Missing on older records.
    */
   availabilityNote?: string
+  /** The PM's reason for selecting the candidate (sending them to the Client Team). Missing on older records. */
+  selectionReason?: string
   /** pe_submitted: the PE has answered the PM's doubt (cleared when the PM raises another) */
   peAnswered?: boolean
+  /**
+   * pe_query / pe_submitted: the PM marked the candidate unanswered (could not reach them), so the PE is to
+   * reach the candidate and tell the PM when they answer — rather than a doubt to answer. Stays set after
+   * the PE's message until the PM raises a doubt. Missing on older records = false.
+   */
+  peUnanswered?: boolean
   /**
    * A doubt the Client Team raised with the PM, waiting for the PM's answer (null once answered).
    * It makes it the PM's turn without moving the candidate's status.
@@ -279,6 +356,8 @@ export interface Application {
   createdAt: number
   createdBy: string
   stageSince: number
+  /** when the Client Team status last changed (missing on older records: stageSince) */
+  ctStatusSince?: number
   lastUpdatedBy: string
   lastUpdatedByName: string
   lastUpdatedAt: number

@@ -44,7 +44,9 @@ export function ClientJobFields({
   const { clients, jobs } = usePlacementLists(keep)
   const kept = keepJobId ?? keep?.jobId
   const client = clients.find((c) => c.id === clientId)
-  const clientJobs = jobs.filter((j) => j.clientId === clientId && (j.status === 'open' || j.id === kept))
+  const clientJobs = jobs
+    .filter((j) => j.clientId === clientId && (j.status === 'open' || j.id === kept))
+    .sort((a, b) => a.title.localeCompare(b.title))
   return (
     <>
       <Field label="Client" required hint={client && `Client Team: ${nameOf(client.assignedClientTeam)}`}>

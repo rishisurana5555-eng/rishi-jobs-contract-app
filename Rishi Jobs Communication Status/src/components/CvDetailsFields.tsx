@@ -1,5 +1,4 @@
 import type { CvDetailsData } from '../workflow/engine'
-import { Suggestion } from './Suggestion'
 import { Field, Input, Select, Textarea } from './ui'
 
 /** Same choices as the CV editor (rishijobs-revisedcvs). */
@@ -32,13 +31,10 @@ export function CvDetailsFields({
   value,
   onChange,
   noteHint = true,
-  suggestions = {},
 }: {
   value: CvDetails
   onChange: (v: CvDetails) => void
   noteHint?: boolean
-  /** values read from the CV, offered under their fields */
-  suggestions?: Partial<Pick<CvDetails, 'currentSalary' | 'expectedSalary' | 'noticePeriod'>>
 }) {
   const set = (patch: Partial<CvDetails>) => onChange({ ...value, ...patch })
   const known = !value.noticePeriod || (NOTICE_PERIODS as readonly string[]).includes(value.noticePeriod)
@@ -49,11 +45,9 @@ export function CvDetailsFields({
     <div className="grid gap-3 sm:grid-cols-2">
       <Field label="Current salary (LPA)" required group>
         <Input inputMode="decimal" value={value.currentSalary} onChange={(e) => set({ currentSalary: e.target.value })} placeholder="e.g. 18 or 18.5" aria-label="Current salary (LPA)" />
-        <Suggestion value={suggestions.currentSalary} current={value.currentSalary} onUse={() => set({ currentSalary: suggestions.currentSalary! })} />
       </Field>
       <Field label="Expected salary (LPA)" required group>
         <Input inputMode="decimal" value={value.expectedSalary} onChange={(e) => set({ expectedSalary: e.target.value })} placeholder="e.g. 24" aria-label="Expected salary (LPA)" />
-        <Suggestion value={suggestions.expectedSalary} current={value.expectedSalary} onUse={() => set({ expectedSalary: suggestions.expectedSalary! })} />
       </Field>
       <Field label="Notice period" required group>
         <Select value={choice} onChange={(e) => set({ noticePeriod: e.target.value === OTHER ? ' ' : e.target.value })} aria-label="Notice period">
@@ -65,7 +59,6 @@ export function CvDetailsFields({
           ))}
           <option value={OTHER}>Other</option>
         </Select>
-        <Suggestion value={suggestions.noticePeriod} current={value.noticePeriod} onUse={() => set({ noticePeriod: suggestions.noticePeriod! })} />
       </Field>
       <Field label="If other, number of days">
         <Input

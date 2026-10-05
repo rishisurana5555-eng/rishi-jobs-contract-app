@@ -33,14 +33,15 @@ import {
   type QuerySnapshot,
   type Transaction,
 } from 'firebase/firestore'
-import { ALL_ADMINS, isAdminRole, type AdminMessage, type AppUser, type JobNote, type CandidateProfile, type Application, type AvailabilityRound, type Client, type Interview, type JobOpening, type TimelineEntry } from '../types'
+import { ALL_ADMINS, DELEGATION_LABEL, isAdminRole, JOB_PRIORITY_LABEL, type AdminMessage, type AppUser, type CatalogEdit, type CatalogLogEntry, type JobNote, type CandidateProfile, type Application, type AvailabilityRound, type Client, type Interview, type JobOpening, type TimelineEntry } from '../types'
 import { duplicatePhoneMessage, phoneKey, type PhoneOwner } from '../components/PhoneInput'
+import { clientChanges, dueLabel, jobChanges } from '../workflow/catalog'
 import { planAction, roundDocId, WorkflowError } from '../workflow/engine'
 import { properName } from '../workflow/names'
 import { appStayedOpen, markBrowserSession } from './browserSession'
 import { resetIdle } from './idleSignOut'
 import { loginEmailFor } from './loginId'
-import type { Backend } from './types'
+import type { Backend, CatalogChange } from './types'
 
 const env = import.meta.env
 const MAX_CV_BYTES = 10 * 1024 * 1024
@@ -129,30 +130,49 @@ export function createFirebaseBackend(): Backend {
     }
   }
 
-  /** Saves a client / job opening; a new one (empty id) is given the next CL- / JB- number. */
-  async function saveNumbered<T extends { id: string }>(col: 'clients' | 'jobOpenings', item: T): Promise<string> {
-    if (item.id) {
-      await setDoc(doc(db, col, item.id), withoutId(item))
-      return item.id
-    }
+  /**
+   * Saves a new client / job opening (empty id) with the next CL- / JB- number, and its first log
+   * entry in the same transaction.
+   */
+  async function saveNumbered<T extends { id: string }>(col: 'clients' | 'jobOpenings', item: T, log: (id: string) => LogData): Promise<string> {
     return runTransaction(db, async (tx) => {
       const { code, commit } = await nextCode(tx, col === 'clients' ? 'clients' : 'jobs')
       const ref = doc(db, col, code)
       if ((await tx.get(ref)).exists()) throw new Error(`ID ${code} is already in use. Please try again.`)
       tx.set(ref, withoutId(item))
+      tx.set(doc(collection(ref, 'log')), log(code))
       commit()
       return code
     })
+  }
+
+  type LogData = Omit<CatalogLogEntry, 'id'>
+  /** clients/{id}/log or jobOpenings/{id}/log: one new entry. */
+  const logRef = (kind: 'client' | 'job', id: string) => doc(collection(db, kind === 'client' ? 'clients' : 'jobOpenings', id, 'log'))
+  const logBy = (by: CatalogChange['by'], at: number) => ({ by: by.id, byName: by.name, role: by.role, at })
+  const jobLog = (
+    j: Pick<JobOpening, 'id' | 'clientId' | 'clientName' | 'title'>,
+    by: CatalogChange['by'],
+    at: number,
+    rest: Pick<LogData, 'action' | 'summary' | 'reason'>,
+  ): LogData => ({ kind: 'job', clientId: j.clientId, clientName: j.clientName, jobId: j.id, jobTitle: j.title, ...rest, ...logBy(by, at) })
+  /** An edit must say why. */
+  const requireReason = (reason: string | undefined) => {
+    const r = (reason ?? '').trim()
+    if (!r) throw new Error('Write the reason for this edit.')
+    return r
   }
 
   /** A client's job openings (the Client Team may only list those of the clients they look after). */
   const clientJobsQuery = (clientId: string, clientTeam: string) =>
     query(collection(db, 'jobOpenings'), where('clientId', '==', clientId), where('assignedClientTeam', '==', clientTeam))
 
-  /** A candidate's submissions: admins and the Client Team find all; a PE / PM those they are on. */
+  /** A candidate's submissions: admins find all; a Client Team member those sent to them; a PE / PM those they are on. */
   const candidateAppsQuery = (candidateId: string, me: AppUser) =>
-    isAdminRole(me.role) || me.role === 'ClientTeam'
+    isAdminRole(me.role)
       ? query(appsCol, where('candidateId', '==', candidateId))
+      : me.role === 'ClientTeam'
+        ? query(appsCol, where('candidateId', '==', candidateId), where('assignedClientTeam', '==', me.id))
       : query(appsCol, where('candidateId', '==', candidateId), where(me.role === 'PE' ? 'assignedPE' : 'assignedPM', '==', me.id))
 
   async function deleteInBatches(refs: DocumentReference[]) {
@@ -273,30 +293,16 @@ export function createFirebaseBackend(): Backend {
     markCatalogSeen: (uid, seenAt) => setDoc(doc(db, 'userState', uid), { catalogSeenAt: seenAt }, { merge: true }),
 
     listenApplications(me, cb, onError) {
-      // The Client Team: the submissions sent to them, and their clients' candidates still with the PM.
-      if (me.role === 'ClientTeam') {
-        const parts: Application[][] = [[], []]
-        const loaded = [false, false]
-        const unsubs = (['assignedClientTeam', 'watchClientTeam'] as const).map((field, i) =>
-          listen<Application>(
-            query(appsCol, where(field, '==', me.id)),
-            (list) => {
-              parts[i] = list
-              loaded[i] = true
-              if (loaded.every(Boolean)) cb([...new Map([...parts[0], ...parts[1]].map((a) => [a.id, a])).values()])
-            },
-            onError,
-          ),
-        )
-        return () => unsubs.forEach((u) => u())
-      }
       // Visibility is enforced by the query (and by firestore.rules), never by manual routing.
+      // The Client Team: only the submissions a PM has sent to them (never those still with the PE / PM).
       const q =
         isAdminRole(me.role)
           ? query(appsCol)
           : me.role === 'PM'
             ? query(appsCol, where('assignedPM', '==', me.id))
-            : query(appsCol, where('assignedPE', '==', me.id))
+            : me.role === 'ClientTeam'
+              ? query(appsCol, where('assignedClientTeam', '==', me.id))
+              : query(appsCol, where('assignedPE', '==', me.id))
       return listen<Application>(q, cb, onError)
     },
     listenTimeline: (appId, cb) =>
@@ -422,7 +428,12 @@ export function createFirebaseBackend(): Backend {
 
     listenCandidates(me, cb) {
       const col = collection(db, 'candidates')
-      const q = isAdminRole(me.role) || me.role === 'ClientTeam' ? query(col) : query(col, where('people', 'array-contains', me.id))
+      // The Client Team loads no profiles: they see only the candidates sent to them (their submissions).
+      if (me.role === 'ClientTeam') {
+        cb([])
+        return () => {}
+      }
+      const q = isAdminRole(me.role) ? query(col) : query(col, where('people', 'array-contains', me.id))
       return listen<CandidateProfile>(q, cb)
     },
 
@@ -436,6 +447,7 @@ export function createFirebaseBackend(): Backend {
     findCandidateApps: (candidateId, me) => getDocs(candidateAppsQuery(candidateId, me)).then((s) => rows<Application>(s)),
 
     async deleteCandidate(candidateId, me) {
+      if (me.role !== 'SuperAdmin') throw new Error('Only the Super Admin can delete a candidate.')
       const list = rows<Application>(await getDocs(candidateAppsQuery(candidateId, me)))
       const profileSnap = await getDoc(doc(db, 'candidates', candidateId)).catch(() => null)
       const profile = profileSnap?.exists() ? (profileSnap.data() as CandidateProfile) : null
@@ -449,10 +461,21 @@ export function createFirebaseBackend(): Backend {
 
     findClientApps: (clientId) => getDocs(query(appsCol, where('clientId', '==', clientId))).then((s) => rows<Application>(s)),
 
-    async deleteClient(clientId) {
+    async deleteClient(clientId, by) {
+      const client = await getDoc(doc(db, 'clients', clientId))
+      // Logged first: the log stays (for the admins) after the client is gone.
+      const c = client.data() as Client | undefined
+      await setDoc(logRef('client', clientId), {
+        kind: 'client',
+        action: 'deleted',
+        clientId,
+        clientName: c?.name ?? clientId,
+        summary: 'Client deleted, with its job openings and the submissions to it',
+        reason: '',
+        ...logBy(by, Date.now()),
+      } satisfies LogData)
       const list = rows<Application>(await getDocs(query(appsCol, where('clientId', '==', clientId))))
       for (const a of list) await deleteApplication(a.id)
-      const client = await getDoc(doc(db, 'clients', clientId))
       const jobs = await getDocs(clientJobsQuery(clientId, (client.data()?.assignedClientTeam as string | undefined) ?? ''))
       await deleteInBatches(jobs.docs.map((d) => d.ref))
       await deleteDoc(doc(db, 'clients', clientId))
@@ -469,52 +492,115 @@ export function createFirebaseBackend(): Backend {
     markMessageRead: (id, uid) => updateDoc(doc(db, 'messages', id), { readBy: arrayUnion(uid) }),
 
     // A new client / job opening (no id yet) gets the next ID: CL-0001… / JB-0001…, whoever adds it.
-    async saveClient(c) {
-      if (!c.id) return saveNumbered('clients', c)
+    async saveClient(c, { by, reason, names }) {
+      const now = Date.now()
+      if (!c.id)
+        return saveNumbered('clients', c, (id) => ({
+          kind: 'client',
+          action: 'created',
+          clientId: id,
+          clientName: c.name,
+          summary: `Client added: ${c.name}${c.contactPerson ? ` (contact: ${c.contactPerson})` : ''} — Client Team: ${names?.(c.assignedClientTeam) ?? c.assignedClientTeam}`,
+          reason: '',
+          ...logBy(by, now),
+        }))
+      const why = requireReason(reason)
       const prev = (await getDoc(doc(db, 'clients', c.id))).data() as Client | undefined
-      await setDoc(doc(db, 'clients', c.id), withoutId(c))
-      // The job openings carry the client's name and Client Team member.
-      if (prev && (prev.name !== c.name || prev.assignedClientTeam !== c.assignedClientTeam)) {
-        const jobs = await getDocs(clientJobsQuery(c.id, prev.assignedClientTeam))
-        for (let i = 0; i < jobs.docs.length; i += 400) {
-          const batch = writeBatch(db)
-          for (const d of jobs.docs.slice(i, i + 400)) batch.update(d.ref, { clientName: c.name, assignedClientTeam: c.assignedClientTeam })
-          await batch.commit()
-        }
+      if (!prev) throw new Error('This client no longer exists.')
+      const changes = clientChanges(prev, c, names)
+      if (!changes.length) throw new Error('Nothing was changed.')
+      const lastEdit: CatalogEdit = { at: now, by: by.id, byName: by.name, role: by.role, reason: why, summary: changes.join('; '), what: 'client' }
+      const batch = writeBatch(db)
+      batch.set(doc(db, 'clients', c.id), { ...withoutId(c), lastEdit })
+      batch.set(logRef('client', c.id), { kind: 'client', action: 'edited', clientId: c.id, clientName: c.name, summary: lastEdit.summary, reason: why, ...logBy(by, now) } satisfies LogData)
+      await batch.commit()
+      // The job openings carry the client's name and Client Team member, and the edit (so their PM and PE are alerted).
+      const jobs = await getDocs(clientJobsQuery(c.id, prev.assignedClientTeam))
+      for (let i = 0; i < jobs.docs.length; i += 400) {
+        const jb = writeBatch(db)
+        for (const d of jobs.docs.slice(i, i + 400)) jb.update(d.ref, { clientName: c.name, assignedClientTeam: c.assignedClientTeam, lastEdit })
+        await jb.commit()
       }
       return c.id
     },
-    async saveJob(j) {
-      if (!j.id) return void (await saveNumbered('jobOpenings', j))
-      await updateDoc(doc(db, 'jobOpenings', j.id), { title: j.title, details: j.details, status: j.status })
+    async saveJob(j, { by, reason }) {
+      const now = Date.now()
+      if (!j.id) {
+        await saveNumbered('jobOpenings', j, (id) =>
+          jobLog({ ...j, id }, by, now, { action: 'created', summary: `Job opening added: ${j.title} — Job status: ${JOB_PRIORITY_LABEL[j.priority ?? 'active']}${j.submitBy ? ` — Submissions due by: ${dueLabel(j.submitBy)}` : ''}`, reason: '' }),
+        )
+        return
+      }
+      const why = requireReason(reason)
+      const prev = (await getDoc(doc(db, 'jobOpenings', j.id))).data() as JobOpening | undefined
+      if (!prev) throw new Error('This job opening no longer exists.')
+      const changes = jobChanges(prev, j)
+      if (!changes.length) throw new Error('Nothing was changed.')
+      const lastEdit: CatalogEdit = { at: now, by: by.id, byName: by.name, role: by.role, reason: why, summary: changes.join('; '), what: 'job' }
+      const batch = writeBatch(db)
+      // Active ↔ Second priority: the job's age starts again from today.
+      const priorityChanged = (prev.priority ?? 'active') !== (j.priority ?? 'active')
+      batch.update(doc(db, 'jobOpenings', j.id), {
+        title: j.title,
+        details: j.details,
+        status: j.status,
+        priority: j.priority ?? 'active',
+        submitBy: j.submitBy ?? null,
+        ...(priorityChanged ? { priorityChangedAt: now } : {}),
+        lastEdit,
+      })
+      batch.set(logRef('job', j.id), jobLog(j, by, now, { action: 'edited', summary: lastEdit.summary, reason: why }))
+      await batch.commit()
     },
-    assignJob(jobId, { to, userId, by, note }) {
+    listenCatalogLog: (kind, id, cb) =>
+      listen<CatalogLogEntry>(query(collection(db, kind === 'client' ? 'clients' : 'jobOpenings', id, 'log'), orderBy('at', 'desc')), cb),
+    loadAllCatalogLog: () => getDocs(collectionGroup(db, 'log')).then((snap) => rows<CatalogLogEntry>(snap).sort((x, y) => y.at - x.at)),
+    async assignJob(jobId, { to, userId, by, note, userName, delegation }) {
       const now = Date.now()
       const text = note.trim()
       const notes = text ? { notes: arrayUnion({ by: by.id, byName: by.name, role: by.role, text, at: now } satisfies JobNote) } : {}
       const ref = doc(db, 'jobOpenings', jobId)
+      const job = { ...((await getDoc(ref)).data() as JobOpening), id: jobId }
+      const batch = writeBatch(db)
       // A new PM starts without a PE: they choose their own.
-      return to === 'PM'
-        ? updateDoc(ref, {
-            assignedPM: userId,
-            pmAssignedAt: now,
-            pmAssignedBy: by.id,
-            pmAssignedByName: by.name,
-            assignedPE: null,
-            peAssignedAt: null,
-            peAssignedBy: null,
-            peAssignedByName: null,
-            ...notes,
-          })
-        : updateDoc(ref, {
-            assignedPE: userId,
-            peAssignedAt: userId ? now : null,
-            peAssignedBy: userId ? by.id : null,
-            peAssignedByName: userId ? by.name : null,
-            ...notes,
-          })
+      if (to === 'PM')
+        batch.update(ref, {
+          assignedPM: userId,
+          pmAssignedAt: now,
+          pmAssignedBy: by.id,
+          pmAssignedByName: by.name,
+          delegation: delegation ?? null,
+          assignedPE: null,
+          peAssignedAt: null,
+          peAssignedBy: null,
+          peAssignedByName: null,
+          ...notes,
+        })
+      else
+        batch.update(ref, {
+          assignedPE: userId,
+          peAssignedAt: userId ? now : null,
+          peAssignedBy: userId ? by.id : null,
+          peAssignedByName: userId ? by.name : null,
+          ...notes,
+        })
+      const summary = userId
+        ? `Assigned to ${to} ${userName ?? userId}${to === 'PM' && delegation ? ` — ${DELEGATION_LABEL[delegation]}` : ''}`
+        : `${to} removed from the job opening`
+      batch.set(
+        logRef('job', jobId),
+        jobLog(job, by, now, { action: to === 'PM' ? 'assigned_pm' : 'assigned_pe', summary: text ? `${summary}. Note: ${text}` : summary, reason: '' }),
+      )
+      await batch.commit()
     },
-    addJobNote: (jobId, note) => updateDoc(doc(db, 'jobOpenings', jobId), { notes: arrayUnion(note) }),
+    async addJobNote(jobId, note) {
+      const ref = doc(db, 'jobOpenings', jobId)
+      const job = { ...((await getDoc(ref)).data() as JobOpening), id: jobId }
+      const batch = writeBatch(db)
+      batch.update(ref, { notes: arrayUnion(note) })
+      batch.set(logRef('job', jobId), jobLog(job, { id: note.by, name: note.byName, role: note.role }, note.at, { action: 'note', summary: `Note: ${note.text}`, reason: '' }))
+      await batch.commit()
+    },
     saveUser: (u) => setDoc(doc(db, 'users', u.id), withoutId(u)),
     newId: () => doc(collection(db, '_ids')).id,
   }

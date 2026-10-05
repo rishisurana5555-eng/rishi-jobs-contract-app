@@ -1,8 +1,8 @@
 import { useEffect, useState } from 'react'
 import { playSound, soundBlocked, unlockAudio } from '../alarm/sound'
 import { useApp } from '../context/AppContext'
-import { duration } from '../workflow/dates'
-import { jobTodo, jobTurnSince } from '../workflow/jobs'
+import { duration, fmtDateTime } from '../workflow/dates'
+import { jobLateText, jobTodo, jobTurnSince } from '../workflow/jobs'
 import { isMyTurn, pendingSince, viewerLabel } from '../workflow/workflow'
 import { Button } from './ui'
 
@@ -11,7 +11,7 @@ import { Button } from './ui'
  * acknowledges it; it comes back 10 minutes later while any of the records is still their turn.
  */
 export function ReminderAlarm() {
-  const { reminder, dismissReminder, apps, jobs, jobWaitsForMe, openJob, me, now, openApp, names } = useApp()
+  const { reminder, dismissReminder, apps, jobs, jobWaitsForMe, jobLateForMe, openJob, me, now, openApp, names } = useApp()
   const [blocked, setBlocked] = useState(false)
 
   useEffect(() => {
@@ -20,10 +20,12 @@ export function ReminderAlarm() {
 
   // Records whose status changed since the alarm (by me or the other side) drop off the list.
   const list = reminder
-    ? apps.filter((a) => reminder.appIds.includes(a.id) && isMyTurn(a, me.id, Math.max(now, reminder.at))).sort((a, b) => pendingSince(a, me.id) - pendingSince(b, me.id))
+    ? apps.filter((a) => reminder.appIds.includes(a.id) && isMyTurn(a, me.id, Math.max(now, reminder.at))).sort((a, b) => a.candidateName.localeCompare(b.candidateName))
     : []
-  // Job openings waiting for me (to assign, or to find a candidate for), until that is done.
-  const jobList = reminder ? jobs.filter((j) => reminder.jobIds.includes(j.id) && jobWaitsForMe(j)) : []
+  // Job openings waiting for me (to assign, or to find a candidate for), or whose submission deadline I missed, until that is done.
+  const jobList = reminder
+    ? jobs.filter((j) => reminder.jobIds.includes(j.id) && (jobWaitsForMe(j) || jobLateForMe(j))).sort((a, b) => a.title.localeCompare(b.title) || a.clientName.localeCompare(b.clientName))
+    : []
   const count = list.length + jobList.length
 
   useEffect(() => {
@@ -48,14 +50,27 @@ export function ReminderAlarm() {
         </div>
 
         <ul className="max-h-[50vh] divide-y divide-slate-100 overflow-y-auto">
-          {jobList.map((j) => (
+          {jobList.map((j) => {
+            const late = jobLateForMe(j)
+            return (
             <li key={j.id} className="flex items-center gap-3 px-5 py-3">
               <div className="min-w-0 flex-1">
                 <div className="truncate text-sm font-semibold text-slate-900">
                   📋 {j.title} <span className="font-normal text-slate-500">· {j.clientName}</span>
                 </div>
-                <div className="text-xs leading-snug text-red-800">Job opening – {jobTodo(j, me)}</div>
-                <div className="text-[11px] text-slate-500">Pending for {duration(now - jobTurnSince(j, me))}</div>
+                {late ? (
+                  <>
+                    <div className="text-xs font-semibold leading-snug text-red-700">⏰ Submission deadline passed – {jobLateText(j, late, names, me.id)}</div>
+                    <div className="text-[11px] text-slate-500">
+                      Was due by {fmtDateTime(j.submitBy!)} ({duration(now - j.submitBy!)} ago)
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div className="text-xs leading-snug text-red-800">Job opening – {jobTodo(j, me)}</div>
+                    <div className="text-[11px] text-slate-500">Pending for {duration(now - jobTurnSince(j, me))}</div>
+                  </>
+                )}
               </div>
               <Button
                 variant="secondary"
@@ -68,7 +83,8 @@ export function ReminderAlarm() {
                 Open
               </Button>
             </li>
-          ))}
+            )
+          })}
           {list.map((a) => (
             <li key={a.id} className="flex items-center gap-3 px-5 py-3">
               <div className="min-w-0 flex-1">

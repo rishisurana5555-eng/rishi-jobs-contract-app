@@ -3,11 +3,22 @@ import { useApp } from '../context/AppContext'
 import type { Application } from '../types'
 import { Alert, Button, Field, Textarea, cx } from './ui'
 
-type Choice = 'send' | 'query' | 'reject'
+type Choice = 'send' | 'query' | 'reject' | 'unanswered'
+
+const REASON_LABEL = { query: 'Your doubt / question to {pe}', reject: 'Reason for rejecting', unanswered: 'Reason — why is it unanswered?' } as const
+const REASON_MISSING = { query: 'Write your question.', reject: 'Write the reason for rejecting.', unanswered: 'Write the reason it is unanswered.' } as const
+const REASON_PLACEHOLDER = {
+  query: 'e.g. Has the candidate handled GST filing on their own?',
+  reject: 'e.g. Experience does not match the job requirement.',
+  unanswered: 'e.g. Called the candidate twice today, no answer; sent a WhatsApp message.',
+} as const
+const ACTION_KIND = { query: 'pm_query', reject: 'pm_reject', unanswered: 'pm_unanswered' } as const
 
 /**
- * PM, on a candidate added by a PE: three choices — pass it to the Client Team (the "Send" form),
- * ask the PE a question (it goes back to the PE until they answer), or reject it (closes the record).
+ * PM, on a candidate added by a PE: four choices — pass it to the Client Team (the "Send" form, which
+ * asks the reason for selection), ask the PE a question (it goes back to the PE until they answer),
+ * reject it (closes the record), or mark it unanswered (it goes to the PE to reach the candidate, and comes
+ * back when the PE says they answered). Each asks a reason.
  */
 export function PmDecisionPanel({ app }: { app: Application }) {
   const { perform, nameOf, setSendToCtId } = useApp()
@@ -21,17 +32,18 @@ export function PmDecisionPanel({ app }: { app: Application }) {
     ['send', '✓ Send', 'Revise the CV and send the candidate to the Client Team.'],
     ['reject', '✕ Reject', `Not suitable — the record is closed and ${pe} is told why.`],
     ['query', '? Doubt', `Ask ${pe} a question — they must answer before you decide.`],
+    ['unanswered', '☎ Unanswered', `The candidate is not answering — ${pe} is asked to reach them and tell you when they answer.`],
   ]
 
   async function submit(e: FormEvent) {
     e.preventDefault()
-    if (choice !== 'query' && choice !== 'reject') return
+    if (!choice || choice === 'send') return
     setError(null)
-    if (!text.trim()) return setError(choice === 'query' ? 'Write your question.' : 'Write the reason for rejecting.')
+    if (!text.trim()) return setError(REASON_MISSING[choice])
     if (choice === 'reject' && !confirm(`Reject ${app.candidateName}? This closes the record.`)) return
     setBusy(true)
     try {
-      await perform(app.id, { kind: choice === 'query' ? 'pm_query' : 'pm_reject', message: text })
+      await perform(app.id, { kind: ACTION_KIND[choice], message: text })
       setText('')
       setChoice(null)
     } catch (err) {
@@ -43,10 +55,17 @@ export function PmDecisionPanel({ app }: { app: Application }) {
 
   return (
     <div className="space-y-3">
+      {app.peAnswered && app.peUnanswered && (
+        <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-900">
+          ☎ <b>{pe}: the candidate answered — connect with them, then choose below.</b>
+          {app.lastActionMessage && <p className="mt-0.5 whitespace-pre-wrap">“{app.lastActionMessage}”</p>}
+        </div>
+      )}
       <p className="text-sm text-slate-700">
-        {pe} added this candidate. Choose one: <b>Send</b> to the Client Team, <b>Reject</b>, or raise a <b>Doubt</b> with {pe}.
+        {pe} added this candidate. Choose one: <b>Send</b> to the Client Team, <b>Reject</b>, raise a <b>Doubt</b> with {pe}, or mark it <b>Unanswered</b>. Each asks
+        for a reason, which goes into the history.
       </p>
-      <div className="grid gap-2 sm:grid-cols-3">
+      <div className="grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
         {choices.map(([c, label, hint]) => (
           <button
             key={c}
@@ -68,21 +87,15 @@ export function PmDecisionPanel({ app }: { app: Application }) {
         ))}
       </div>
 
-      {(choice === 'query' || choice === 'reject') && (
+      {choice && choice !== 'send' && (
         <form onSubmit={submit} className="space-y-3">
-          <Field label={choice === 'query' ? `Your doubt / question to ${pe}` : 'Reason for rejecting'} required>
-            <Textarea
-              rows={3}
-              value={text}
-              onChange={(e) => setText(e.target.value)}
-              placeholder={choice === 'query' ? 'e.g. Has the candidate handled GST filing on their own?' : 'e.g. Experience does not match the job requirement.'}
-              autoFocus
-            />
+          <Field label={REASON_LABEL[choice].replace('{pe}', pe)} required>
+            <Textarea rows={3} value={text} onChange={(e) => setText(e.target.value)} placeholder={REASON_PLACEHOLDER[choice]} autoFocus />
           </Field>
           {error && <Alert>{error}</Alert>}
           <div className="flex gap-2">
             <Button type="submit" busy={busy} variant={choice === 'reject' ? 'danger' : undefined}>
-              {choice === 'query' ? `Send question to ${pe}` : 'Reject candidate'}
+              {choice === 'query' ? `Send question to ${pe}` : choice === 'reject' ? 'Reject candidate' : 'Mark as unanswered'}
             </Button>
             <Button type="button" variant="secondary" onClick={() => setChoice(null)}>
               Cancel
@@ -94,17 +107,22 @@ export function PmDecisionPanel({ app }: { app: Application }) {
   )
 }
 
-/** PE: the PM raised a doubt about their candidate; the answer sends the candidate back to the PM. */
+/**
+ * PE: the PM raised a doubt about their candidate, or could not reach the candidate (unanswered). The
+ * answer — or the message that the candidate answered — sends the candidate back to the PM.
+ */
 export function PeAnswerPanel({ app }: { app: Application }) {
   const { perform, nameOf } = useApp()
   const [text, setText] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const pm = nameOf(app.assignedPM)
+  const unanswered = !!app.peUnanswered
 
   async function submit(e: FormEvent) {
     e.preventDefault()
     setError(null)
-    if (!text.trim()) return setError('Write your answer.')
+    if (!text.trim()) return setError(unanswered ? `Write your message to ${pm}.` : 'Write your answer.')
     setBusy(true)
     try {
       await perform(app.id, { kind: 'pe_answer', message: text })
@@ -119,15 +137,23 @@ export function PeAnswerPanel({ app }: { app: Application }) {
   return (
     <form onSubmit={submit} className="space-y-3">
       <div className="rounded-lg border border-slate-200 bg-white p-3 text-sm">
-        <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">Doubt from {nameOf(app.assignedPM)}</div>
+        <div className="text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+          {unanswered ? `Marked unanswered by ${pm} — reason` : `Doubt from ${pm}`}
+        </div>
         <p className="mt-1 whitespace-pre-wrap text-slate-800">{app.lastActionMessage || app.latestMessage}</p>
       </div>
-      <Field label="Your answer" required>
-        <Textarea rows={3} value={text} onChange={(e) => setText(e.target.value)} placeholder="Answer your PM’s doubt" />
+      {unanswered && <p className="text-sm text-slate-600">Call the candidate. When they answer, tell {pm} here so {pm} can connect with them.</p>}
+      <Field label={unanswered ? `Message to ${pm}` : 'Your answer'} required>
+        <Textarea
+          rows={3}
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          placeholder={unanswered ? 'e.g. The candidate answered at 4 PM and is available now — please call them.' : 'Answer your PM’s doubt'}
+        />
       </Field>
       {error && <Alert>{error}</Alert>}
       <Button type="submit" busy={busy}>
-        Send answer to {nameOf(app.assignedPM)}
+        {unanswered ? `Candidate answered — tell ${pm}` : `Send answer to ${pm}`}
       </Button>
     </form>
   )

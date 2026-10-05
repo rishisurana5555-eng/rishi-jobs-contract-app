@@ -28,6 +28,7 @@ import {
   isClosed,
   optionByCode,
   PE_ANSWER_LABEL,
+  PE_REACHED_LABEL,
   PE_SUBMIT_LABEL,
   peAddedLabel,
   sideOf,
@@ -106,13 +107,19 @@ export interface PeSubmitData extends CvDetailsData {
 export type Action =
   | { kind: 'pe_submit'; data: PeSubmitData; message?: string }
   /** PM: revised CV + (possibly edited) details of a PE's candidate → Client Team */
-  | { kind: 'send_to_ct'; data: SubmitData; message?: string }
+  | { kind: 'send_to_ct'; data: SubmitData; message?: string; /** why the PM selected the candidate */ reason: string }
   /** PM, on a PE's candidate: reject it (message = the reason) */
   | { kind: 'pm_reject'; message: string }
+  /** PM, on a PE's candidate: the candidate is not answering (message = the reason / details); stays with the PM, the PE is told */
+  | { kind: 'pm_unanswered'; message: string }
   /** PM, on a PE's candidate: ask the PE a question before deciding */
   | { kind: 'pm_query'; message: string }
   /** PM: generated the revised CV, checked it and confirmed it (a history entry only; nothing else changes, nobody is alerted) */
   | { kind: 'cv_checked'; fileName: string }
+  /** PM: clicked "Generate revised CV" and got the revised CV back (a history entry only; nobody is alerted) */
+  | { kind: 'cv_generated'; fileName: string }
+  /** Client Team: opened / downloaded the revised CV (a history entry only; nobody is alerted) */
+  | { kind: 'cv_downloaded' }
   /** Client Team: ask the PM a question about the candidate; it is the PM's turn until they answer (the status doesn't move) */
   | { kind: 'ct_doubt'; message: string }
   /** PM: answer the Client Team's doubt */
@@ -297,6 +304,7 @@ function freshApp(id: string, now: number, actor: Actor, fields: FreshFields): A
     createdAt: now,
     createdBy: actor.id,
     stageSince: now,
+    ctStatusSince: now,
     lastUpdatedBy: actor.id,
     lastUpdatedByName: actor.name,
     lastUpdatedAt: now,
@@ -455,6 +463,7 @@ function planSendToCt(ctx: EngineContext, action: Extract<Action, { kind: 'send_
   const revisedCvUrl = requireText(d.revisedCvUrl, 'Revised CV')
   requirePlacement(d)
   const message = requireDatesMessage(action.message, 'candidate’s')
+  const reason = requireText(action.reason, 'The reason for selection')
 
   const app = freshApp(prev.id, now, actor, {
     candidateId: prev.candidateId,
@@ -484,6 +493,7 @@ function planSendToCt(ctx: EngineContext, action: Extract<Action, { kind: 'send_
   app.createdAt = prev.createdAt
   app.createdBy = prev.createdBy
   app.lastActionMessage = message
+  app.selectionReason = reason
   return {
     app,
     isNew: false,
@@ -491,7 +501,25 @@ function planSendToCt(ctx: EngineContext, action: Extract<Action, { kind: 'send_
     candidate: { id: app.candidateId, data: { ...profileDetails(app), updatedAt: now } },
     rounds: candidateDates.length ? [{ id: roundDocId(1, 1), data: { candidateDates, updatedAt: now } }] : [],
     interviews: [],
-    timeline: submittedToCtTimeline(actor, now, 'pe_submitted', d.revisedCvName, message, candidateDates.length ? candidateDates : null),
+    timeline: [
+      // The PM's decision first, with the reason for it; then the revised CV and the send.
+      {
+        type: 'status_change',
+        side: 'PM',
+        fromStage: 'pe_submitted',
+        toStage: null,
+        statusCode: 'pm_select',
+        statusLabel: `Selected by PM ${actor.name}`,
+        message: reason,
+        dates: null,
+        interviewRound: 1,
+        actor: actor.id,
+        actorName: actor.name,
+        actorRole: 'PM',
+        timestamp: now - 1,
+      },
+      ...submittedToCtTimeline(actor, now, 'pe_submitted', d.revisedCvName, message, candidateDates.length ? candidateDates : null),
+    ],
   }
 }
 
@@ -556,8 +584,23 @@ export function planAction(ctx: EngineContext, action: Action): WritePlan {
       } else {
         app.stage = 'pe_query'
         app.peAnswered = false
+        app.peUnanswered = false
         statusLabel = `PM ${actor.name} raised a doubt`
       }
+      break
+    }
+
+    // The PM could not reach the candidate: it goes to the PE (their turn) to reach them, like a doubt.
+    case 'pm_unanswered': {
+      if (side !== 'PM') throw new WorkflowError('Only the assigned PM can do this.')
+      if (prev.stage !== 'pe_submitted') throw new WorkflowError('This candidate is no longer waiting for your decision. Please refresh.')
+      requireText(action.message, 'The reason')
+      app.stage = 'pe_query'
+      app.peAnswered = false
+      app.peUnanswered = true
+      type = 'status_change'
+      statusCode = 'pm_unanswered'
+      statusLabel = `Marked unanswered by PM ${actor.name}`
       break
     }
 
@@ -578,6 +621,24 @@ export function planAction(ctx: EngineContext, action: Action): WritePlan {
       type = 'cv_upload'
       statusCode = 'cv_checked'
       statusLabel = `Revised CV made and checked by PM ${actor.name}${action.fileName ? ` (${action.fileName})` : ''}`
+      break
+    }
+
+    case 'cv_generated': {
+      if (side !== 'PM') throw new WorkflowError('Only the assigned PM revises the CV.')
+      if (prev.stage !== 'pe_submitted') throw new WorkflowError('This candidate has already been sent to the Client Team.')
+      type = 'cv_upload'
+      statusCode = 'cv_generated'
+      statusLabel = `Revised CV generated by PM ${actor.name}${action.fileName ? ` (${action.fileName})` : ''}`
+      break
+    }
+
+    case 'cv_downloaded': {
+      if (side !== 'ClientTeam') throw new WorkflowError('Only the Client Team member on this candidate can do this.')
+      if (!prev.revisedCvUrl) throw new WorkflowError('There is no revised CV yet.')
+      type = 'cv_upload'
+      statusCode = 'cv_downloaded'
+      statusLabel = `Revised CV downloaded by ${actor.name}`
       break
     }
 
@@ -606,13 +667,13 @@ export function planAction(ctx: EngineContext, action: Action): WritePlan {
     }
 
     case 'pe_answer': {
-      if (prev.stage !== 'pe_query') throw new WorkflowError('There is no open question from the PM. Please refresh.')
-      requireText(action.message, 'Your answer')
+      if (prev.stage !== 'pe_query') throw new WorkflowError('There is nothing from the PM waiting for your reply. Please refresh.')
+      requireText(action.message, prev.peUnanswered ? 'Your message to the PM' : 'Your answer')
       app.stage = 'pe_submitted'
       app.peAnswered = true
       type = 'status_change'
-      statusCode = 'pe_answer'
-      statusLabel = PE_ANSWER_LABEL
+      statusCode = prev.peUnanswered ? 'pe_reached' : 'pe_answer'
+      statusLabel = prev.peUnanswered ? PE_REACHED_LABEL : PE_ANSWER_LABEL
       break
     }
 
@@ -825,11 +886,12 @@ export function planAction(ctx: EngineContext, action: Action): WritePlan {
     app.candidateWaitUntil = null
   }
   if (app.pmStatus !== prev.pmStatus || app.clientTeamStatus !== prev.clientTeamStatus) app.stageSince = now
+  if (app.clientTeamStatus !== prev.clientTeamStatus) app.ctStatusSince = now
 
-  // A history-only entry (the PM checked the revised CV) alerts nobody; a doubt between the Client Team
-  // and the PM, and its answer, only the other of the two.
+  // A history-only entry (the PM generated / checked the revised CV, the Client Team downloaded it)
+  // alerts nobody; a doubt between the Client Team and the PM, and its answer, only the other of the two.
   const recipients =
-    action.kind === 'cv_checked'
+    action.kind === 'cv_checked' || action.kind === 'cv_generated' || action.kind === 'cv_downloaded'
       ? []
       : action.kind === 'ct_doubt'
         ? [app.assignedPM]

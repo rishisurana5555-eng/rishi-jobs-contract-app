@@ -67,10 +67,15 @@ export function toEpoch(date: string, time: string): number {
   return new Date(y, m - 1, d, hh, mm).getTime()
 }
 
-export function todayIso(offsetDays = 0): string {
-  const d = new Date()
-  d.setDate(d.getDate() + offsetDays)
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+const pad2 = (n: number) => String(n).padStart(2, '0')
+
+/** Today as YYYY-MM-DD (local time), e.g. the earliest date a date input allows. */
+export const todayIso = () => toDateAndTime(Date.now()).date
+
+/** Epoch ms → local YYYY-MM-DD and HH:MM (the inverse of toEpoch). */
+export function toDateAndTime(ms: number): { date: string; time: string } {
+  const d = new Date(ms)
+  return { date: `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`, time: `${pad2(d.getHours())}:${pad2(d.getMinutes())}` }
 }
 
 // ---------- display formatting ----------

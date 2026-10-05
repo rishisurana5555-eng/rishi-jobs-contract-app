@@ -1,11 +1,13 @@
 import { useEffect, useState } from 'react'
 import { playSound } from '../alarm/sound'
 import { useApp } from '../context/AppContext'
-import { isAdminRole, type AppUser, type JobOpening, type JobStatus, type Role } from '../types'
-import { fmtDateTime, timeAgo } from '../workflow/dates'
-import { JOB_STATUS_LABEL, jobStatusWarning, jobStep, jobStepLabel, jobTodo } from '../workflow/jobs'
+import { DELEGATION_LABEL, isAdminRole, JOB_PRIORITY_LABEL, type AppUser, type Delegation, type JobOpening, type JobPriority, type JobStatus, type Role } from '../types'
+import { delegationLabel, priorityLabel } from '../workflow/catalog'
+import { duration, fmtDateTime, timeAgo } from '../workflow/dates'
+import { JOB_STATUS_LABEL, jobAgeDays, jobAgeFrom, jobAgeTone, jobLateText, jobStatusWarning, jobStep, jobStepLabel, jobTodo } from '../workflow/jobs'
 import type { Tone } from '../workflow/workflow'
 import { AddCandidateForm } from './AddCandidateForm'
+import { CatalogLog } from './CatalogLog'
 import { StatusBadge, ToneBadge } from './StatusBadge'
 import { Alert, Button, Card, Empty, Input, Modal, Select, Tabs, Textarea, cx } from './ui'
 
@@ -20,10 +22,73 @@ function StatusPill({ status }: { status: JobStatus }) {
   return <span className={cx('inline-block whitespace-nowrap rounded-md px-2 py-0.5 text-xs font-medium ring-1 ring-inset', STATUS_STYLE[status])}>{JOB_STATUS_LABEL[status]}</span>
 }
 
-/** Red: waiting for me (to assign it, or — a PE — to submit a candidate for it); green: with a PE who has; yellow: with someone else. */
+/** Job status (Active / Second priority) and, once a PM is assigned, the delegation. */
+function PriorityPills({ job: j }: { job: JobOpening }) {
+  return (
+    <>
+      <span
+        className={cx(
+          'inline-block whitespace-nowrap rounded-md px-2 py-0.5 text-xs font-medium ring-1 ring-inset',
+          (j.priority ?? 'active') === 'active' ? 'bg-sky-50 text-sky-800 ring-sky-200' : 'bg-orange-50 text-orange-800 ring-orange-200',
+        )}
+      >
+        {priorityLabel(j.priority)}
+      </span>
+      {j.delegation && (
+        <span className="inline-block whitespace-nowrap rounded-md bg-violet-50 px-2 py-0.5 text-xs font-medium text-violet-800 ring-1 ring-inset ring-violet-200">
+          {delegationLabel(j.delegation)}
+        </span>
+      )}
+    </>
+  )
+}
+
+/**
+ * Red: waiting for me (to assign it, or — a PE — to submit a candidate for it), or its submission deadline
+ * was missed; green: with a PE who has; yellow: with someone else.
+ */
 function useJobTone() {
-  const { jobWaitsForMe } = useApp()
-  return (j: JobOpening): Tone => (jobWaitsForMe(j) ? 'red' : jobStep(j) === 'with_pe' ? 'green' : 'yellow')
+  const { jobWaitsForMe, jobLateForMe } = useApp()
+  return (j: JobOpening): Tone => (jobWaitsForMe(j) || jobLateForMe(j) ? 'red' : jobStep(j) === 'with_pe' ? 'green' : 'yellow')
+}
+
+/** The columns the job openings table can be sorted by (the arrow next to the header). */
+type SortKey = 'job' | 'client' | 'status' | 'age'
+interface Sort {
+  key: SortKey
+  /** asc: A–Z; for Age, youngest first; for Status, open → on hold → closed (Active before Second priority) */
+  asc: boolean
+}
+
+const STATUS_ORDER: Record<JobStatus, number> = { open: 0, 'on-hold': 1, closed: 2 }
+const SORTS: Record<SortKey, (a: JobOpening, b: JobOpening) => number> = {
+  job: (a, b) => a.title.localeCompare(b.title),
+  client: (a, b) => a.clientName.localeCompare(b.clientName),
+  status: (a, b) => STATUS_ORDER[a.status] - STATUS_ORDER[b.status] || priorityLabel(a.priority).localeCompare(priorityLabel(b.priority)),
+  age: (a, b) => (jobAgeFrom(b) ?? 0) - (jobAgeFrom(a) ?? 0),
+}
+/** Ties: by job title, then client (always A–Z). */
+const sortJobs = (list: JobOpening[], { key, asc }: Sort) =>
+  [...list].sort((a, b) => (asc ? 1 : -1) * SORTS[key](a, b) || SORTS.job(a, b) || SORTS.client(a, b))
+
+/** A column header with an arrow: click to sort by it; click again to reverse. */
+function SortHeader({ label, k, sort, onSort, title }: { label: string; k: SortKey; sort: Sort; onSort: (s: Sort) => void; title?: string }) {
+  const on = sort.key === k
+  return (
+    <th className="px-3 py-2" title={title}>
+      <button
+        type="button"
+        onClick={() => onSort({ key: k, asc: on ? !sort.asc : true })}
+        className={cx('inline-flex items-center gap-1 uppercase tracking-wide hover:text-slate-800', on && 'text-slate-800')}
+        aria-label={`Sort by ${label}`}
+      >
+        {label}
+        <span aria-hidden className={cx('text-xs', !on && 'text-slate-300')}>
+          {on ? (sort.asc ? '▲' : '▼') : '↕'}
+        </span>
+      </button>
+    </th>
+  )
 }
 
 /** The status shown for a job opening: what I have to do when it waits for me. */
@@ -44,6 +109,9 @@ export function JobOpenings() {
   const [filter, setFilter] = useState<'mine' | 'all'>(hasTurn && jobsToAssign.length ? 'mine' : 'all')
   const [search, setSearch] = useState('')
   const [status, setStatus] = useState<JobStatus | ''>('')
+  const [priority, setPriority] = useState<JobPriority | ''>('')
+  // Listed A–Z by job title until another column's arrow is clicked.
+  const [sort, setSort] = useState<Sort>({ key: 'job', asc: true })
   // Leaving the Job openings tab closes the job opening that was open.
   useEffect(() => () => setOpenId(null), [setOpenId])
 
@@ -58,22 +126,15 @@ export function JobOpenings() {
   const q = search.trim().toLowerCase()
   const matches = (j: JobOpening) => !q || [j.clientName, j.title, j.id, j.clientId].some((s) => s.toLowerCase().includes(q))
   const searched = base.filter(matches)
-  const shown = searched
-    .filter((j) => !status || j.status === status)
-    .sort((a, b) => a.clientName.localeCompare(b.clientName) || (b.createdAt ?? 0) - (a.createdAt ?? 0))
+  const shown = sortJobs(
+    searched.filter((j) => (!status || j.status === status) && (!priority || (j.priority ?? 'active') === priority)),
+    sort,
+  )
   const count = (s: JobStatus) => searched.filter((j) => j.status === s).length
+  const countPriority = (p: JobPriority) => searched.filter((j) => (j.priority ?? 'active') === p).length
 
   return (
     <section className="space-y-3">
-      <p className="text-sm text-slate-500">
-        {isAdminRole(me.role)
-          ? 'New job openings from the Client Team come to you. Open one to read it and assign it to a PM.'
-          : me.role === 'PM'
-            ? 'Job openings the Admin assigned to you. Open one to read it and assign it to one of your PEs.'
-            : me.role === 'PE'
-              ? 'Job openings your PM assigned to you. Open one to read it and add candidates for it.'
-              : 'Your clients’ job openings and who they are assigned to.'}
-      </p>
       <div className="flex flex-wrap items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2 shadow-sm">
         {hasTurn && (
           <Tabs
@@ -91,19 +152,27 @@ export function JobOpenings() {
           <option value="on-hold">On hold ({count('on-hold')})</option>
           <option value="closed">Closed ({count('closed')})</option>
         </Select>
+        <Select value={priority} onChange={(e) => setPriority(e.target.value as JobPriority | '')} className="w-auto py-1.5" aria-label="Active or second priority">
+          <option value="">Active & second priority ({searched.length})</option>
+          {(Object.keys(JOB_PRIORITY_LABEL) as JobPriority[]).map((p) => (
+            <option key={p} value={p}>
+              {JOB_PRIORITY_LABEL[p]} ({countPriority(p)})
+            </option>
+          ))}
+        </Select>
         <Input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search client, job title or ID…" className="w-full py-1.5 sm:ml-auto sm:w-64" />
       </div>
 
       {!shown.length ? (
         <Empty>{base.length ? 'No job openings match.' : filter === 'mine' ? 'Nothing waiting for you.' : 'No job openings yet.'}</Empty>
       ) : (
-        <JobTable jobs={shown} onOpen={show} />
+        <JobTable jobs={shown} onOpen={show} sort={sort} onSort={setSort} />
       )}
     </section>
   )
 }
 
-function JobTable({ jobs, onOpen }: { jobs: JobOpening[]; onOpen: (id: string) => void }) {
+function JobTable({ jobs, onOpen, sort, onSort }: { jobs: JobOpening[]; onOpen: (id: string) => void; sort: Sort; onSort: (s: Sort) => void }) {
   const { me, now, jobWaitsForMe, apps } = useApp()
   const tone = useJobTone()
   const label = useJobLabel()
@@ -126,34 +195,53 @@ function JobTable({ jobs, onOpen }: { jobs: JobOpening[]; onOpen: (id: string) =
       <table className="w-full text-left text-sm">
         <thead className="bg-slate-50 text-[11px] uppercase tracking-wide text-slate-500">
           <tr>
-            <th className="px-3 py-2">Job opening</th>
-            <th className="px-3 py-2">Client</th>
-            <th className="px-3 py-2">Status</th>
+            <SortHeader label="Job opening" k="job" sort={sort} onSort={onSort} />
+            <SortHeader label="Client" k="client" sort={sort} onSort={onSort} />
+            <SortHeader label="Status" k="status" sort={sort} onSort={onSort} />
             <th className="px-3 py-2">Assigned</th>
             <th className="px-3 py-2 text-right" title={me.role === 'PE' ? 'Candidates you have submitted for this job opening' : 'Candidates submitted for this job opening'}>
               {me.role === 'PE' ? 'My submissions' : 'Submissions'}
             </th>
-            <th className="px-3 py-2">Added</th>
+            <SortHeader label="Age" k="age" sort={sort} onSort={onSort} title="Days since the job opening was added, or since its priority last changed (day 1 = that day)" />
             <th className="px-3 py-2" />
           </tr>
         </thead>
         <tbody className="divide-y divide-slate-100">
           {jobs.map((j) => {
             const a = action(j)
+            const age = jobAgeDays(j, now)
+            const ageTone = jobAgeTone(age)
+            const from = jobAgeFrom(j)
             return (
-              <tr key={j.id} className="cursor-pointer hover:bg-slate-50" onClick={() => onOpen(j.id)}>
+              // Older than 7 days: orange row; older than 12 days: red row.
+              <tr
+                key={j.id}
+                className={cx(
+                  'cursor-pointer border-l-4',
+                  ageTone === 'red' ? 'border-l-red-500 bg-red-50 hover:bg-red-100' : ageTone === 'orange' ? 'border-l-orange-400 bg-orange-50 hover:bg-orange-100' : 'border-l-transparent hover:bg-slate-50',
+                )}
+                onClick={() => onOpen(j.id)}
+              >
                 <td className="px-3 py-2">
                   <span className="font-medium text-slate-900">{j.title}</span> <span className="text-xs text-slate-400">{j.id}</span>
                 </td>
                 <td className="px-3 py-2 whitespace-nowrap">{j.clientName}</td>
                 <td className="px-3 py-2">
-                  <StatusPill status={j.status} />
+                  <div className="flex flex-wrap gap-1">
+                    <StatusPill status={j.status} />
+                    <PriorityPills job={j} />
+                  </div>
                 </td>
                 <td className="px-3 py-2">
                   <ToneBadge tone={tone(j)} className="whitespace-nowrap">{label(j)}</ToneBadge>
                 </td>
                 <td className="px-3 py-2 text-right font-semibold tabular-nums text-slate-800">{submissions.get(j.id) ?? 0}</td>
-                <td className="px-3 py-2 whitespace-nowrap text-xs text-slate-500">{j.createdAt ? timeAgo(j.createdAt, now) : '—'}</td>
+                <td
+                  className={cx('px-3 py-2 whitespace-nowrap text-xs', ageTone === 'red' ? 'font-bold text-red-700' : ageTone === 'orange' ? 'font-bold text-orange-700' : 'text-slate-500')}
+                  title={from ? `${j.priorityChangedAt ? 'Priority changed' : 'Added'} ${fmtDateTime(from)}` : undefined}
+                >
+                  {age == null ? '—' : `${age} day${age > 1 ? 's' : ''}`}
+                </td>
                 <td className="px-3 py-2 text-right">
                   <Button
                     variant={a.primary ? 'primary' : 'secondary'}
@@ -180,7 +268,7 @@ function JobTable({ jobs, onOpen }: { jobs: JobOpening[]; onOpen: (id: string) =
 function AddCandidateModal({ job: j, onClose }: { job: JobOpening; onClose: () => void }) {
   const { openApp } = useApp()
   return (
-    <Modal title={`Add Candidate — ${j.title} at ${j.clientName}`} onClose={onClose} wide>
+    <Modal title={`Add Candidate — ${j.title} at ${j.clientName}`} onClose={onClose} full>
       <AddCandidateForm
         jobId={j.id}
         onDone={(id) => {
@@ -194,8 +282,9 @@ function AddCandidateModal({ job: j, onClose }: { job: JobOpening; onClose: () =
 
 /** One job opening: its details and notes, and handing it on (Admin → PM, PM → PE). */
 function JobPage({ job: j, onBack }: { job: JobOpening; onBack: () => void }) {
-  const { me, nameOf, apps, now } = useApp()
+  const { me, nameOf, names, apps, now, jobLateForMe } = useApp()
   const tone = useJobTone()
+  const late = jobLateForMe(j)
   const label = useJobLabel()
   const [adding, setAdding] = useState(false)
   const candidates = apps.filter((a) => a.jobId === j.id).length
@@ -223,16 +312,32 @@ function JobPage({ job: j, onBack }: { job: JobOpening; onBack: () => void }) {
             </div>
           </div>
           <div className="flex flex-col items-end gap-1.5">
-            <StatusPill status={j.status} />
+            <div className="flex flex-wrap justify-end gap-1">
+              <StatusPill status={j.status} />
+              <PriorityPills job={j} />
+            </div>
             <ToneBadge tone={tone(j)}>{label(j)}</ToneBadge>
           </div>
         </div>
+
+        {j.submitBy && (
+          <div className={cx('mt-3 rounded-lg border px-3 py-2 text-sm', late ? 'border-red-300 bg-red-50 text-red-800' : 'border-sky-200 bg-sky-50 text-sky-900')}>
+            {late ? '⏰ ' : '📅 '}
+            <b>Submissions due by {fmtDateTime(j.submitBy)}</b>
+            {late
+              ? ` — the deadline passed ${duration(now - j.submitBy)} ago. ${jobLateText(j, late, names, me.id)}`
+              : now >= j.submitBy
+                ? ' — the deadline has passed.'
+                : ` — ${duration(j.submitBy - now)} left. Candidates must be submitted before this time.`}
+          </div>
+        )}
 
         {warning && (
           <div className="mt-3">
             <Alert tone="warn">⚠ {warning}</Alert>
           </div>
         )}
+
 
         <h3 className="mt-4 text-xs font-semibold uppercase tracking-wide text-slate-500">Job details</h3>
         {j.details ? (
@@ -256,6 +361,10 @@ function JobPage({ job: j, onBack }: { job: JobOpening; onBack: () => void }) {
 
       <JobCandidates job={j} />
 
+      <Card title="Log — every change to this job opening">
+        <CatalogLog kind="job" id={j.id} />
+      </Card>
+
       {adding && <AddCandidateModal job={j} onClose={() => setAdding(false)} />}
     </section>
   )
@@ -267,7 +376,7 @@ function JobPage({ job: j, onBack }: { job: JobOpening; onBack: () => void }) {
  */
 function JobCandidates({ job: j }: { job: JobOpening }) {
   const { apps, me, nameOf, openApp } = useApp()
-  const list = apps.filter((a) => a.jobId === j.id).sort((a, b) => b.createdAt - a.createdAt)
+  const list = apps.filter((a) => a.jobId === j.id).sort((a, b) => a.candidateName.localeCompare(b.candidateName))
   const earlier = (id: string | null, current: string | null) => !!id && id !== current
   return (
     <Card title={`Candidates for this job (${list.length})`}>
@@ -372,25 +481,41 @@ function Notes({ job: j, now }: { job: JobOpening; now: number }) {
 }
 
 /** Choose the person and, optionally, write a note: it goes into the notes, for them to read. */
-function AssignForm({ label, people, current, onAssign }: { label: 'PM' | 'PE'; people: AppUser[]; current: string | null; onAssign: (userId: string | null, note: string) => Promise<void> }) {
+function AssignForm({
+  label,
+  people,
+  current,
+  currentDelegation,
+  onAssign,
+}: {
+  label: 'PM' | 'PE'
+  people: AppUser[]
+  current: string | null
+  /** PM only: the job opening's delegation now */
+  currentDelegation?: Delegation | null
+  onAssign: (userId: string | null, note: string, delegation?: Delegation) => Promise<void>
+}) {
   const { nameOf } = useApp()
   const [userId, setUserId] = useState(current ?? '')
+  const [delegation, setDelegation] = useState<Delegation | ''>(currentDelegation ?? '')
+  useEffect(() => setDelegation(currentDelegation ?? ''), [currentDelegation])
   const [note, setNote] = useState('')
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   /** "assigned successfully", until the next change */
   const [done, setDone] = useState<string | null>(null)
-  const changed = userId !== (current ?? '')
+  const changed = userId !== (current ?? '') || (label === 'PM' && delegation !== (currentDelegation ?? ''))
   // Someone else changed it meanwhile: show the person it is with now.
   useEffect(() => setUserId(current ?? ''), [current])
 
   async function assign() {
     if (!userId && label === 'PM') return setError('Choose the PM.')
+    if (label === 'PM' && !delegation) return setError('Choose the delegation (1st, 2nd or 3rd).')
     setBusy(true)
     setError(null)
     setDone(null)
     try {
-      await onAssign(userId || null, note)
+      await onAssign(userId || null, note, delegation || undefined)
       setNote('')
       setDone(userId ? `✓ Job opening assigned to ${label} ${nameOf(userId)} successfully.${note.trim() ? ' Your note was added to the notes.' : ''}` : `✓ The PE was removed from this job opening.`)
       playSound('success')
@@ -412,6 +537,16 @@ function AssignForm({ label, people, current, onAssign }: { label: 'PM' | 'PE'; 
             </option>
           ))}
         </Select>
+        {label === 'PM' && (
+          <Select value={delegation} onChange={(e) => setDelegation(e.target.value ? (Number(e.target.value) as Delegation) : '')} className="sm:w-72" aria-label="Delegation">
+            <option value="">— Choose the delegation —</option>
+            {([1, 2, 3] as Delegation[]).map((d) => (
+              <option key={d} value={d}>
+                {DELEGATION_LABEL[d]}
+              </option>
+            ))}
+          </Select>
+        )}
         <Textarea rows={2} value={note} onChange={(e) => setNote(e.target.value)} placeholder={`Note for the ${label} (optional) — it is added to the job opening's notes above.`} />
         {current && changed && (
           <p className="text-xs text-slate-500">
@@ -432,20 +567,21 @@ function AssignForm({ label, people, current, onAssign }: { label: 'PM' | 'PE'; 
 }
 
 function AssignPm({ job: j }: { job: JobOpening }) {
-  const { users, me, backend } = useApp()
+  const { users, me, backend, nameOf } = useApp()
   const pms = users.filter((u) => u.role === 'PM' && u.active !== false).sort((a, b) => a.name.localeCompare(b.name))
   return (
     <AssignForm
       label="PM"
       people={pms}
       current={j.assignedPM}
-      onAssign={(userId, note) => backend.assignJob(j.id, { to: 'PM', userId, by: me, note })}
+      currentDelegation={j.delegation}
+      onAssign={(userId, note, delegation) => backend.assignJob(j.id, { to: 'PM', userId, by: me, note, delegation, userName: nameOf(userId) })}
     />
   )
 }
 
 function AssignPe({ job: j }: { job: JobOpening }) {
-  const { users, me, backend } = useApp()
+  const { users, me, backend, nameOf } = useApp()
   const pes = users.filter((u) => u.role === 'PE' && u.active !== false)
   // The PM's own PEs; if none report to them, every PE.
   const mine = pes.filter((u) => u.reportsTo === me.id)
@@ -454,7 +590,7 @@ function AssignPe({ job: j }: { job: JobOpening }) {
       label="PE"
       people={(mine.length ? mine : pes).sort((a, b) => a.name.localeCompare(b.name))}
       current={j.assignedPE}
-      onAssign={(userId, note) => backend.assignJob(j.id, { to: 'PE', userId, by: me, note })}
+      onAssign={(userId, note) => backend.assignJob(j.id, { to: 'PE', userId, by: me, note, userName: nameOf(userId) })}
     />
   )
 }

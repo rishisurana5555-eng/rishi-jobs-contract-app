@@ -2,14 +2,14 @@ import { useState } from 'react'
 import { useApp } from '../context/AppContext'
 import type { Application } from '../types'
 import { fmtDateTime, timeAgo } from '../workflow/dates'
-import { beforeClientTeam, isClosed } from '../workflow/workflow'
+import { isClosed } from '../workflow/workflow'
 import { StatCard } from './DashboardWidgets'
 import { StatusBadge } from './StatusBadge'
 import { Card, Empty, Select } from './ui'
 
 /**
- * The Client Team's view of each of their clients: every candidate submitted for it so far (also those
- * still with the PE / PM), when, by whom, and where each one is now.
+ * The Client Team's view of each of their clients (A–Z): every candidate the PMs have sent them for it so
+ * far (A–Z), when, by whom, and where each one is now.
  */
 export function ClientStatus() {
   const { clients, apps } = useApp()
@@ -48,7 +48,7 @@ function ClientCard({ name, id, apps }: { name: string; id: string; apps: Applic
   const count = (test: (a: Application) => boolean) => apps.filter(test).length
   const first = apps.length ? Math.min(...apps.map((a) => a.createdAt)) : null
   const latest = apps.length ? Math.max(...apps.map((a) => a.createdAt)) : null
-  const rows = [...apps].sort((a, b) => b.createdAt - a.createdAt)
+  const rows = [...apps].sort((a, b) => a.candidateName.localeCompare(b.candidateName))
 
   return (
     <Card
@@ -58,10 +58,9 @@ function ClientCard({ name, id, apps }: { name: string; id: string; apps: Applic
         </span>
       }
     >
-      <div className="grid grid-cols-2 gap-2 sm:grid-cols-4 lg:grid-cols-7">
+      <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6">
         <StatCard label="Submissions till date" value={apps.length} />
-        <StatCard label="With PE / PM" value={count((a) => beforeClientTeam(a.stage))} tone="amber" />
-        <StatCard label="With you / client" value={count((a) => !beforeClientTeam(a.stage) && a.stage !== 'interview_scheduled' && !isClosed(a.stage))} />
+        <StatCard label="With you / client" value={count((a) => a.stage !== 'interview_scheduled' && !isClosed(a.stage))} />
         <StatCard label="Interview scheduled" value={count((a) => a.stage === 'interview_scheduled')} tone="blue" />
         <StatCard label="Placed" value={count((a) => a.stage === 'closed_placed')} tone="green" />
         <StatCard label="Rejected" value={count((a) => a.stage === 'closed_rejected')} />
@@ -74,7 +73,7 @@ function ClientCard({ name, id, apps }: { name: string; id: string; apps: Applic
       )}
 
       {!rows.length ? (
-        <p className="mt-3 text-sm text-slate-400">No candidates submitted for this client yet.</p>
+        <p className="mt-3 text-sm text-slate-400">No candidates sent to you for this client yet.</p>
       ) : (
         <div className="mt-3 overflow-x-auto rounded-lg border border-slate-200">
           <table className="w-full text-left text-sm">

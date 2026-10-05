@@ -1,11 +1,12 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import type { Backend } from '../backend'
-import { isAdminRole, type AdminMessage, type AppUser, type Application, type CandidateProfile, type Client, type JobOpening } from '../types'
+import { isAdminRole, type AdminMessage, type AppUser, type Application, type CandidateProfile, type CatalogEdit, type Client, type JobOpening } from '../types'
 import { properName } from '../workflow/names'
 import { playSound, stopSound, type SoundKind } from '../alarm/sound'
 import { needsAutoDebrief, SYSTEM_ACTOR, type Action } from '../workflow/engine'
-import { firstReminderAt, isMyTurn, REMINDER_EVERY_MS, sideOf, type Names } from '../workflow/workflow'
-import { jobEventsFor, jobNeedsMe, jobTurnSince } from '../workflow/jobs'
+import { ctStaleSince, CT_STALE_ALERT_MS, firstReminderAt, isMyTurn, peUnansweredOverdueAt, REMINDER_EVERY_MS, sideOf, type Names } from '../workflow/workflow'
+import { fmtDateTime } from '../workflow/dates'
+import { jobEventsFor, jobLate, jobLateFor, jobLateText, jobNeedsMe, jobTurnSince, type JobLate } from '../workflow/jobs'
 
 export interface Toast {
   id: number
@@ -27,8 +28,6 @@ export interface Toast {
 
 /** Alerts about clients / job openings from longer ago than this are skipped for someone with no record yet. */
 const ANNOUNCE_LOOKBACK_MS = 7 * 86_400_000
-/** A job opening added this soon after its client counts as "at a new client". */
-const NEW_CLIENT_JOB_MS = 30 * 60_000
 
 /**
  * The automatic "interview time passed → debrief pending" move. The Client Team's dashboard makes it;
@@ -69,6 +68,14 @@ interface AppState {
   jobsToAssign: JobOpening[]
   /** is this job opening waiting for me? */
   jobWaitsForMe: (j: JobOpening) => boolean
+  /** its submission deadline has passed without a submission, as far as it concerns me (see jobLateFor) */
+  jobLateForMe: (j: JobOpening) => JobLate | null
+  /** the job openings jobLateForMe flags, A–Z by job title */
+  lateJobs: JobOpening[]
+  /** Admins: PE candidates the PM marked unanswered with no reply from the PE for 48+ hours */
+  peUnansweredLate: Application[]
+  /** Super Admin: CVs with the client whose Client Team status has not changed for 6+ days */
+  ctStale: Application[]
   /** the job opening whose page is open (the dashboard switches to Job openings) */
   openJobId: string | null
   openJob: (id: string | null) => void
@@ -266,18 +273,22 @@ export function AppProvider({ backend, me, children }: { backend: Backend; me: A
     const prev = seen.current
     const next = new Map(apps.map((a) => [a.id, a.lastUpdatedAt]))
     seen.current = next
-    if (!prev) return // first load: counts only, no pop-ups
+    // First load: what became my turn while I was away (unread, waiting for me) pops up once now;
+    // other unread changes only show in the counts.
     const fresh = apps.filter(
       (a) =>
-        (prev.get(a.id) ?? 0) < a.lastUpdatedAt && a.lastUpdatedBy !== me.id && a.unreadFor.includes(me.id),
+        a.lastUpdatedBy !== me.id &&
+        a.unreadFor.includes(me.id) &&
+        (prev ? (prev.get(a.id) ?? 0) < a.lastUpdatedAt : isMyTurn(a, me.id)),
     )
     if (!fresh.length) return
     const soundKey = `toasts-${toastSeq + 1}`
     const newToasts = fresh.map((a) => ({ ...toastFor(a, me.id), soundKey }))
     setToasts((t) => [...newToasts, ...t].slice(0, 5))
     playSound(soundFor(newToasts), soundKey)
-    // It has just become my turn: the repeating alarm starts 10 minutes from now.
-    for (const t of newToasts) if (t.actionRequired) nextRing.current.set(`a:${t.appId}`, Date.now() + REMINDER_EVERY_MS)
+    // It has just become my turn: the repeating alarm starts 10 minutes from now. (At login, what was
+    // already waiting keeps its own schedule — an overdue one still rings at once.)
+    if (prev) for (const t of newToasts) if (t.actionRequired) nextRing.current.set(`a:${t.appId}`, Date.now() + REMINDER_EVERY_MS)
     for (const t of newToasts)
       desktopNotify(t.title, { body: [t.body, t.message && `“${t.message}”`].filter(Boolean).join(' — '), tag: t.appId }, soundKey, () =>
         setSelectedId(t.appId),
@@ -310,56 +321,112 @@ export function AppProvider({ backend, me, children }: { backend: Backend; me: A
   }, [apps, now, backend, me.id])
 
   // Job openings are handed down Client Team → Admin → PM → PE, and only the people concerned are
-  // alerted, once: the admins about a new job opening (or a new client without one), a PM / PE when one is assigned to them,
-  // and the client's Client Team member as it moves on. What each person has been alerted about is
-  // saved in userState/{uid}, so it doesn't repeat on reload or another device.
+  // alerted, once: the admins about a new client and a new job opening, a PM / PE when one is assigned
+  // to them, and the client's Client Team member as it moves on. An edit (with its reason) goes to the
+  // admins and to the PM and PE on the job openings concerned. What each person has been alerted about
+  // is saved in userState/{uid}, so it doesn't repeat on reload or another device.
   useEffect(() => {
     if (!clientsLoaded || !jobsLoaded || !users.length || catalogSeenAt === undefined) return
     const since = catalogSeenAt ?? Date.now() - ANNOUNCE_LOOKBACK_MS
     const nameOf = (id: string) => users.find((u) => u.id === id)?.name
-    const clientById = new Map(clients.map((c) => [c.id, c]))
-    const hasJobs = new Set(jobs.map((j) => j.clientId))
-    const isNewClient = (clientId: string, jobAt?: number) => {
-      const c = clientById.get(clientId)
-      return !!c?.createdAt && !!jobAt && jobAt - c.createdAt < NEW_CLIENT_JOB_MS
-    }
-    // The admins, the moment the client is saved: a client added with job openings is announced through
-    // them ("New job opening … (new client)"); one added without any gets its own alert.
-    const withoutJobs = (c: Client) => (c.jobsAtCreation ?? (hasJobs.has(c.id) ? 1 : 0)) === 0
-    const lonelyClients = isAdminRole(me.role) ? clients.filter((c) => c.createdBy !== me.id && withoutJobs(c)) : []
+    const admin = isAdminRole(me.role)
+    const editBody = (e: CatalogEdit) => `by ${e.byName} — ${e.summary}. Reason: ${e.reason}`
     const items = [
-      ...lonelyClients.map((c) => ({
+      // Every new client → the admins.
+      ...(admin ? clients.filter((c) => c.createdBy !== me.id) : []).map((c) => ({
         key: `c:${c.id}`,
         at: c.createdAt,
-        title: `📢 New client added without a job opening: ${c.name}`,
-        body: `added by ${c.createdByName ?? 'the Client Team'} — no job opening yet`,
+        title: `📢 New client added: ${c.name}`,
+        body: `added by ${c.createdByName ?? 'the Client Team'}`,
         actionRequired: false,
         jobId: undefined as string | undefined,
       })),
-      ...jobs.flatMap((j) =>
-        jobEventsFor(me, j, nameOf).map((e) => ({
-          ...e,
-          jobId: j.id,
-          title: e.key.endsWith(':new') && isNewClient(j.clientId, j.createdAt) ? `📢 New client added with a job opening: ${j.title} at ${j.clientName}` : e.title,
-        })),
-      ),
+      // A client edited → the admins (from the client), and the PM / PE of its job openings (stamped on them).
+      ...(admin ? clients : [])
+        .filter((c) => c.lastEdit && c.lastEdit.by !== me.id)
+        .map((c) => ({ key: `ce:${c.id}:${c.lastEdit!.at}`, at: c.lastEdit!.at, title: `✏️ Client edited: ${c.name}`, body: editBody(c.lastEdit!), actionRequired: false, jobId: undefined as string | undefined })),
+      ...jobs
+        .filter((j) => j.lastEdit && j.lastEdit.by !== me.id && (admin ? j.lastEdit.what === 'job' : j.assignedPM === me.id || j.assignedPE === me.id))
+        .map((j) => {
+          const e = j.lastEdit!
+          return e.what === 'client'
+            ? { key: `ce:${j.clientId}:${e.at}`, at: e.at, title: `✏️ Client edited: ${j.clientName}`, body: editBody(e), actionRequired: false, jobId: j.id as string | undefined }
+            : { key: `je:${j.id}:${e.at}`, at: e.at, title: `✏️ Job opening edited: ${j.title} at ${j.clientName}`, body: editBody(e), actionRequired: false, jobId: j.id as string | undefined }
+        }),
+      ...jobs.flatMap((j) => jobEventsFor(me, j, nameOf).map((e) => ({ ...e, jobId: j.id as string | undefined }))),
+      // A submission deadline passed without a submission → the admins, once per deadline (`now` notices it passing).
+      ...(admin && appsLoaded ? jobs : []).flatMap((j) => {
+        const late = jobLate(j, apps, Date.now())
+        return late
+          ? [{
+              key: `jl:${j.id}:${j.submitBy}`,
+              at: j.submitBy!,
+              title: `⏰ Submission deadline missed: ${j.title} at ${j.clientName}`,
+              body: `Due by ${fmtDateTime(j.submitBy!)} — ${jobLateText(j, late, nameOf)}`,
+              actionRequired: true,
+              jobId: j.id as string | undefined,
+            }]
+          : []
+      }),
+      // A PE has not replied for 48 hours to a candidate the PM marked unanswered → the admins, once per doubt.
+      ...(admin && appsLoaded ? apps : []).flatMap((a) => {
+        const at = peUnansweredOverdueAt(a, Date.now())
+        return at
+          ? [{
+              key: `pu:${a.id}:${a.stageSince}`,
+              at,
+              title: `⚠ PE has not answered for 48 hours: ${a.candidateName}`,
+              body: `${nameOf(a.assignedPM) ?? 'The PM'} marked the candidate unanswered for ${nameOf(a.assignedPE ?? '') ?? 'the PE'} on ${fmtDateTime(a.stageSince)} — ${a.jobTitle} at ${a.clientName}`,
+              actionRequired: true,
+              jobId: undefined as string | undefined,
+              appId: a.id,
+            }]
+          : []
+      }),
+      // The Client Team status has not changed for 6 days with the CV at the client → the Super Admin, once per status.
+      ...(me.role === 'SuperAdmin' && appsLoaded ? apps : []).flatMap((a) => {
+        const since = ctStaleSince(a, Date.now())
+        return since
+          ? [{
+              key: `cs:${a.id}:${since}`,
+              at: since + CT_STALE_ALERT_MS,
+              title: `🔴 Client Team status unchanged for 6 days: ${a.candidateName}`,
+              body: `${nameOf(a.assignedClientTeam) ?? 'The Client Team'} — ${a.jobTitle} at ${a.clientName}, no change since ${fmtDateTime(since)}`,
+              actionRequired: true,
+              jobId: undefined as string | undefined,
+              appId: a.id,
+            }]
+          : []
+      }),
     ].filter((x): x is typeof x & { at: number } => !!x.at && x.at > since && !announced.current.has(x.key))
     if (!items.length) return
     for (const x of items) announced.current.add(x.key)
+    const unique = [...new Map(items.map((x) => [x.key, x])).values()]
     const soundKey = `announce-${toastSeq + 1}`
-    const newToasts: Toast[] = items
+    const newToasts: Toast[] = unique
       .sort((a, b) => b.at - a.at)
-      .map((x) => ({ id: ++toastSeq, appId: '', jobId: x.jobId, title: x.title, body: x.body, message: '', actionRequired: x.actionRequired, announcement: true, soundKey }))
+      .map((x) => ({ id: ++toastSeq, appId: 'appId' in x && typeof x.appId === 'string' ? x.appId : '', jobId: x.jobId, title: x.title, body: x.body, message: '', actionRequired: x.actionRequired, announcement: true, soundKey }))
     setToasts((t) => [...newToasts, ...t].slice(0, 8))
     playSound(newToasts.some((t) => t.actionRequired) ? 'alert' : 'notify', soundKey)
-    for (const t of newToasts) desktopNotify(t.title, { body: t.body }, soundKey, t.jobId ? () => setOpenJobId(t.jobId!) : undefined)
+    for (const t of newToasts)
+      desktopNotify(t.title, { body: t.body }, soundKey, t.appId ? () => setSelectedId(t.appId) : t.jobId ? () => setOpenJobId(t.jobId!) : undefined)
     backend.markCatalogSeen(me.id, Math.max(...items.map((x) => x.at))).catch(console.error)
-  }, [clients, jobs, users, clientsLoaded, jobsLoaded, catalogSeenAt, backend, me])
+  }, [clients, jobs, apps, appsLoaded, now, users, clientsLoaded, jobsLoaded, catalogSeenAt, backend, me])
 
   // The job openings I have submitted candidates for (a PE's job opening waits for them until then).
   const submittedJobIds = useMemo(() => new Set(me.role === 'PE' ? apps.filter((a) => a.assignedPE === me.id).map((a) => a.jobId) : []), [apps, me])
   const jobWaitsForMe = useCallback((j: JobOpening) => jobNeedsMe(j, me, submittedJobIds), [me, submittedJobIds])
   const jobsWaiting = useMemo(() => jobs.filter(jobWaitsForMe), [jobs, jobWaitsForMe])
+  const jobLateForMe = useCallback((j: JobOpening) => (appsLoaded ? jobLateFor(j, apps, me, now) : null), [apps, appsLoaded, me, now])
+  const peUnansweredLate = useMemo(
+    () => (isAdminRole(me.role) ? apps.filter((a) => peUnansweredOverdueAt(a, now)).sort((a, b) => a.stageSince - b.stageSince) : []),
+    [apps, me.role, now],
+  )
+  const ctStale = useMemo(
+    () => (me.role === 'SuperAdmin' ? apps.filter((a) => ctStaleSince(a, now)).sort((a, b) => ctStaleSince(a, now)! - ctStaleSince(b, now)!) : []),
+    [apps, me.role, now],
+  )
+  const lateJobs = useMemo(() => jobs.filter((j) => jobLateForMe(j)).sort((a, b) => a.title.localeCompare(b.title) || a.clientName.localeCompare(b.clientName)), [jobs, jobLateForMe])
 
   // Reminder alarm: every 10 minutes while a record or a job opening is my turn, until that changes.
   // All overdue ones ring together, then their next alarm is 10 minutes later.
@@ -371,6 +438,10 @@ export function AppProvider({ backend, me, children }: { backend: Backend; me: A
       const mine = [
         ...apps.filter((a) => isMyTurn(a, me.id, t)).map((a) => ({ key: `a:${a.id}`, first: firstReminderAt(a, me.id), name: a.candidateName })),
         ...jobsWaiting.map((j) => ({ key: `j:${j.id}`, first: jobTurnSince(j, me) + REMINDER_EVERY_MS, name: `${j.title} at ${j.clientName}` })),
+        // The PM / PE who missed a job opening's submission deadline: rings the moment it passes ("d:").
+        ...(me.role === 'PM' || me.role === 'PE' ? jobs : [])
+          .filter((j) => jobLateFor(j, apps, me, t))
+          .map((j) => ({ key: `d:${j.id}`, first: j.submitBy!, name: `${j.title} at ${j.clientName} (submission deadline passed)` })),
       ]
       const keys = new Set(mine.map((x) => x.key))
       for (const k of nextRing.current.keys()) if (!keys.has(k)) nextRing.current.delete(k)
@@ -379,7 +450,7 @@ export function AppProvider({ backend, me, children }: { backend: Backend; me: A
       const overdue = mine.filter((x) => x.first <= t)
       for (const x of overdue) nextRing.current.set(x.key, t + REMINDER_EVERY_MS)
       const ids = (prefix: string) => overdue.filter((x) => x.key.startsWith(prefix)).map((x) => x.key.slice(2))
-      setReminder({ appIds: ids('a:'), jobIds: ids('j:'), at: t })
+      setReminder({ appIds: ids('a:'), jobIds: [...new Set([...ids('j:'), ...ids('d:')])], at: t })
       playSound('alarm', REMINDER_SOUND)
       desktopNotify(
         `⏰ ${overdue.length} task${overdue.length > 1 ? 's' : ''} pending — please finish as soon as possible`,
@@ -390,7 +461,7 @@ export function AppProvider({ backend, me, children }: { backend: Backend; me: A
     check()
     const timer = setInterval(check, 15_000)
     return () => clearInterval(timer)
-  }, [apps, appsLoaded, jobsWaiting, jobsLoaded, me])
+  }, [apps, appsLoaded, jobs, jobsWaiting, jobsLoaded, me])
 
   const dismissReminder = useCallback(() => {
     stopSound(REMINDER_SOUND)
@@ -443,6 +514,10 @@ export function AppProvider({ backend, me, children }: { backend: Backend; me: A
       jobs,
       jobsToAssign: jobsWaiting,
       jobWaitsForMe,
+      jobLateForMe,
+      lateJobs,
+      peUnansweredLate,
+      ctStale,
       openJobId,
       openJob: setOpenJobId,
       apps,
@@ -468,7 +543,7 @@ export function AppProvider({ backend, me, children }: { backend: Backend; me: A
       deletingCandidate,
       setDeletingCandidate,
     }
-  }, [backend, me, users, clients, jobs, jobsWaiting, jobWaitsForMe, openJobId, apps, appsLoaded, loadError, now, selectedId, openApp, perform, toasts, dismissToast, reminder, dismissReminder, sendToCtId, messages, messagesOpen, candidates, deletingCandidate])
+  }, [backend, me, users, clients, jobs, jobsWaiting, jobWaitsForMe, jobLateForMe, lateJobs, peUnansweredLate, ctStale, openJobId, apps, appsLoaded, loadError, now, selectedId, openApp, perform, toasts, dismissToast, reminder, dismissReminder, sendToCtId, messages, messagesOpen, candidates, deletingCandidate])
 
   return <Ctx.Provider value={value}>{children}</Ctx.Provider>
 }

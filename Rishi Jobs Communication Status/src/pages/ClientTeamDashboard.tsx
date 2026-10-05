@@ -1,16 +1,16 @@
 import { useEffect, useState } from 'react'
 import { ApplicationTable } from '../components/ApplicationTable'
-import { byRecent, DashboardTop, FilterBar, StatCard, StatusFilter, useSearch } from '../components/DashboardWidgets'
+import { FilterBar, StatusFilter, useCountBoxes, useSearch } from '../components/DashboardWidgets'
 import { ClientStatus } from '../components/ClientStatus'
 import { JobOpenings } from '../components/JobOpenings'
 import { ColorLegend } from '../components/StatusBadge'
-import { Empty, Select, cx } from '../components/ui'
+import { Select, cx } from '../components/ui'
 import { useApp } from '../context/AppContext'
 import type { Application, Stage } from '../types'
-import { beforeClientTeam, isClosed, isMyTurn } from '../workflow/workflow'
+import { isClosed, isMyTurn } from '../workflow/workflow'
 import { SetupPage } from './SetupPage'
 
-type Filter = 'action' | 'all' | 'unread' | 'with_pm' | Stage | 'completed'
+type Filter = 'action' | 'all' | 'unread' | Stage | 'completed'
 
 export function ClientTeamDashboard() {
   const { me } = useApp()
@@ -24,7 +24,6 @@ export function ClientTeamDashboard() {
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <h1 className="text-xl font-bold text-slate-900">Hello, {me.name}</h1>
-          <p className="text-sm text-slate-500">Submissions for your clients — including candidates still with the PE / PM.</p>
         </div>
         <div className="flex rounded-lg bg-white p-1 shadow-sm ring-1 ring-slate-200">
           {(['submissions', 'status', 'jobs', 'setup'] as const).map((t) => (
@@ -54,7 +53,6 @@ function Submissions() {
     ['action', 'My Action Required', (a) => isMyTurn(a, me.id, now)],
     ['all', 'All', () => true],
     ['unread', 'Unread', (a) => a.unreadFor.includes(me.id)],
-    ['with_pm', 'With PE / PM – not sent yet', (a) => beforeClientTeam(a.stage)],
     ['new_submission', 'New submissions', (a) => a.stage === 'new_submission'],
     ['cv_with_client', 'CV with client', (a) => a.stage === 'cv_with_client'],
     ['rescheduling', 'Getting new dates', (a) => a.stage === 'rescheduling'],
@@ -63,39 +61,30 @@ function Submissions() {
     ['completed', 'Completed', (a) => isClosed(a.stage)],
   ]
   const test = tests.find((t) => t[0] === filter)![2]
-  const shown = apps.filter((a) => test(a) && match(a) && (!clientId || a.clientId === clientId) && (!pmId || a.assignedPM === pmId)).sort(byRecent)
+  const shown = apps.filter((a) => test(a) && match(a) && (!clientId || a.clientId === clientId) && (!pmId || a.assignedPM === pmId))
 
   // Every client and every PM, not only those that already have submissions.
   const allClients = [...clients].sort((a, b) => a.name.localeCompare(b.name))
   const allPms = users.filter((u) => u.role === 'PM' && u.active !== false).sort((a, b) => a.name.localeCompare(b.name))
 
-  // Client → Job opening → candidates
-  const groups = new Map<string, { name: string; jobs: Map<string, { title: string; apps: Application[] }> }>()
-  for (const a of shown) {
-    const g = groups.get(a.clientId) ?? { name: a.clientName, jobs: new Map() }
-    const j = g.jobs.get(a.jobId) ?? { title: a.jobTitle, apps: [] }
-    j.apps.push(a)
-    g.jobs.set(a.jobId, j)
-    groups.set(a.clientId, g)
-  }
-  const sortedGroups = [...groups.entries()].sort((a, b) => a[1].name.localeCompare(b[1].name))
+  const stage = (st: Stage) => apps.filter((a) => a.stage === st)
+  const { boxes, page } = useCountBoxes(
+    [
+      { key: 'action', label: 'My action required', count: actionRequired.length, tone: 'red', apps: actionRequired, empty: '🎉 Nothing needs your action right now.' },
+      { key: 'unread', label: 'Unread updates', count: unread.length, tone: 'amber', apps: unread, empty: 'No unread updates.' },
+      { key: 'new', label: 'New submissions', count: stage('new_submission').length, tone: 'slate', apps: stage('new_submission'), empty: 'No new submissions.' },
+      { key: 'interview', label: 'Interviews scheduled', count: stage('interview_scheduled').length, tone: 'blue', apps: stage('interview_scheduled'), empty: 'No interviews scheduled.' },
+    ],
+    'ct',
+  )
+  if (page) return page
 
   return (
     <div className="space-y-5">
-      <DashboardTop
-        actionApps={actionRequired}
-        stats={
-          <>
-            <StatCard label="Action required" value={actionRequired.length} tone="red" onClick={() => setFilter('action')} active={filter === 'action'} />
-            <StatCard label="Unread updates" value={unread.length} tone="amber" onClick={() => setFilter('unread')} active={filter === 'unread'} />
-            <StatCard label="New submissions" value={apps.filter((a) => a.stage === 'new_submission').length} onClick={() => setFilter('new_submission')} active={filter === 'new_submission'} />
-            <StatCard label="Interviews scheduled" value={apps.filter((a) => a.stage === 'interview_scheduled').length} tone="blue" onClick={() => setFilter('interview_scheduled')} active={filter === 'interview_scheduled'} />
-          </>
-        }
-      />
+      {boxes}
 
       <section className="space-y-3">
-        <h2 className="text-sm font-semibold text-slate-700">By client</h2>
+        <h2 className="text-sm font-semibold text-slate-700">All candidates ({shown.length})</h2>
         <FilterBar search={search} onSearch={setSearch}>
           <StatusFilter value={filter} onChange={setFilter} options={tests.map(([f, label, t]) => [f, label, apps.filter(t).length])} />
           <Select value={clientId} onChange={(e) => setClientId(e.target.value)} className="w-auto py-1.5" aria-label="Client filter">
@@ -117,25 +106,8 @@ function Submissions() {
         </FilterBar>
         <ColorLegend />
 
-        {sortedGroups.length ? (
-          sortedGroups.map(([cid, g]) => (
-            <div key={cid} className="space-y-2">
-              <h3 className="flex items-baseline gap-2 pt-2 text-base font-bold text-brand-800">
-                {g.name} <span className="text-xs font-normal text-slate-400">{cid}</span>
-              </h3>
-              {[...g.jobs.entries()].map(([jid, j]) => (
-                <div key={jid} className="space-y-1.5 pl-0 sm:pl-3">
-                  <h4 className="text-sm font-semibold text-slate-600">
-                    {j.title} <span className="font-normal text-slate-400">· {j.apps.length} candidate{j.apps.length > 1 ? 's' : ''}</span>
-                  </h4>
-                  <ApplicationTable apps={j.apps} variant="ct" />
-                </div>
-              ))}
-            </div>
-          ))
-        ) : (
-          <Empty>No submissions match this filter.</Empty>
-        )}
+        {/* One list of every client's candidates: by client (A–Z), then job opening, then candidate. */}
+        <ApplicationTable apps={shown} variant="ct" empty="No submissions match this filter." />
       </section>
     </div>
   )

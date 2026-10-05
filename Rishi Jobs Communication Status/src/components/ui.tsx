@@ -101,25 +101,38 @@ export function Alert({ tone = 'error', children }: { tone?: 'error' | 'warn' | 
   return <div className={cx('rounded-lg border px-3 py-2 text-sm', cls)}>{children}</div>
 }
 
-export function Modal({ title, onClose, children, wide }: { title: string; onClose: () => void; children: ReactNode; wide?: boolean }) {
+export function Modal({
+  title,
+  onClose,
+  children,
+  wide,
+  full,
+}: {
+  title: string
+  onClose: () => void
+  children: ReactNode
+  wide?: boolean
+  /** the whole screen, edge to edge (a CV beside a form); the body scrolls under a fixed header */
+  full?: boolean
+}) {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => e.key === 'Escape' && onClose()
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
   }, [onClose])
   return (
-    <div className="fixed inset-0 z-40 flex items-start justify-center overflow-y-auto bg-slate-900/40 p-0 sm:p-6" onMouseDown={onClose}>
+    <div className={cx('fixed inset-0 z-40 flex items-start justify-center bg-slate-900/40', full ? '' : 'overflow-y-auto p-0 sm:p-6')} onMouseDown={onClose}>
       <div
-        className={cx('min-h-full w-full bg-white shadow-xl sm:min-h-0 sm:rounded-xl', wide ? 'sm:max-w-3xl' : 'sm:max-w-xl')}
+        className={cx('w-full bg-white shadow-xl', full ? 'flex h-full flex-col' : cx('min-h-full sm:min-h-0 sm:rounded-xl', wide ? 'sm:max-w-3xl' : 'sm:max-w-xl'))}
         onMouseDown={(e) => e.stopPropagation()}
       >
-        <header className="flex items-center justify-between border-b border-slate-200 px-5 py-3">
+        <header className="flex shrink-0 items-center justify-between border-b border-slate-200 px-5 py-3">
           <h2 className="font-semibold">{title}</h2>
           <button onClick={onClose} className="rounded p-1 text-slate-500 hover:bg-slate-100" aria-label="Close">
             ✕
           </button>
         </header>
-        <div className="p-5">{children}</div>
+        <div className={full ? 'min-h-0 flex-1 overflow-y-auto p-3 sm:p-4' : 'p-5'}>{children}</div>
       </div>
     </div>
   )

@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { AddCandidateForm } from '../components/AddCandidateForm'
 import { ApplicationTable } from '../components/ApplicationTable'
-import { byRecent, FilterBar, StatCard, StatusFilter, useSearch } from '../components/DashboardWidgets'
+import { FilterBar, StatusFilter, useCountBoxes, useSearch } from '../components/DashboardWidgets'
 import { ColorLegend } from '../components/StatusBadge'
 import { CandidatesList } from '../components/CandidatesList'
 import { JobOpenings } from '../components/JobOpenings'
@@ -17,7 +17,7 @@ type Filter = 'all' | 'with_pm' | 'in_progress' | 'interview' | 'placed' | 'reje
  * interviews and the full history (open a candidate). The PM and Client Team update the status.
  */
 export function PEDashboard() {
-  const { me, apps, jobs, openApp, setMessagesOpen, unreadMessages } = useApp()
+  const { me, apps, jobs, openApp, setMessagesOpen, unreadMessages, actionRequired } = useApp()
   const [filter, setFilter] = useState<Filter>('all')
   const [adding, setAdding] = useState(false)
   const [tab, setTab] = useState<'submissions' | 'jobs' | 'candidates'>('submissions')
@@ -36,15 +36,27 @@ export function PEDashboard() {
     ['rejected', 'Rejected', (a) => a.stage === 'closed_rejected'],
     ['backout', 'Candidate backout', (a) => a.stage === 'closed_backout'],
   ]
-  const count = (f: Filter) => apps.filter(tests.find((t) => t[0] === f)![2]).length
+  const of = (f: Filter) => apps.filter(tests.find((t) => t[0] === f)![2])
+  const count = (f: Filter) => of(f).length
   const test = tests.find((t) => t[0] === filter)![2]
+  // My action required: the PM's doubts and "unanswered" candidates waiting for me.
+  const box = (key: Filter, label: string, tone: 'amber' | 'slate' | 'blue' | 'green', empty: string) => ({ key, label, count: count(key), tone, apps: of(key), empty })
+  const { boxes, page } = useCountBoxes(
+    [
+      { key: 'action', label: 'My action required', count: actionRequired.length, tone: 'red', apps: actionRequired, empty: '🎉 Nothing needs your action right now.' },
+      box('with_pm', 'Submitted to PM', 'amber', 'No candidates with your PM.'),
+      box('in_progress', 'With Client Team / client', 'slate', 'No candidates with the Client Team or client.'),
+      box('interview', 'Interviews scheduled', 'blue', 'No interviews scheduled.'),
+      box('placed', 'Placed', 'green', 'No candidates placed yet.'),
+    ],
+    'pe',
+  )
 
   return (
     <div className="space-y-5">
       <div className="flex flex-wrap items-center justify-between gap-3">
         <div>
           <h1 className="text-xl font-bold text-slate-900">Hello, {me.name}</h1>
-          <p className="text-sm text-slate-500">Add candidates for the job openings your PM assigned to you, and follow their status.</p>
         </div>
         <div className="flex flex-wrap gap-2">
           <Button variant="secondary" onClick={() => setMessagesOpen(true)}>
@@ -68,25 +80,22 @@ export function PEDashboard() {
         <JobOpenings />
       ) : tab === 'candidates' ? (
         <CandidatesList />
+      ) : page ? (
+        page
       ) : (
       <>
-      <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-        <StatCard label="Submitted to PM" value={count('with_pm')} tone="amber" onClick={() => setFilter('with_pm')} active={filter === 'with_pm'} />
-        <StatCard label="With Client Team / client" value={count('in_progress')} onClick={() => setFilter('in_progress')} active={filter === 'in_progress'} />
-        <StatCard label="Interviews scheduled" value={count('interview')} tone="blue" onClick={() => setFilter('interview')} active={filter === 'interview'} />
-        <StatCard label="Placed" value={count('placed')} tone="green" onClick={() => setFilter('placed')} active={filter === 'placed'} />
-      </div>
+      {boxes}
 
       <FilterBar search={search} onSearch={setSearch}>
         <StatusFilter value={filter} onChange={setFilter} options={tests.map(([f, label]) => [f, label, count(f)])} />
       </FilterBar>
       <ColorLegend />
-      <ApplicationTable apps={apps.filter((a) => test(a) && match(a)).sort(byRecent)} variant="pe" empty="No candidates here yet. Use “＋ Add Candidate” to add one." />
+      <ApplicationTable apps={apps.filter((a) => test(a) && match(a))} variant="pe" empty="No candidates here yet. Use “＋ Add Candidate” to add one." />
       </>
       )}
 
       {adding && (
-        <Modal title="Add Candidate" onClose={() => setAdding(false)} wide>
+        <Modal title="Add Candidate" onClose={() => setAdding(false)} full>
           <AddCandidateForm
             onDone={(id) => {
               setAdding(false)
